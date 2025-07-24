@@ -1,8 +1,6 @@
 const express = require('express');
 const { v4: uuidv4 } = require('uuid');
-const Session = require('../models/Session');
-const User = require('../models/User');
-const Transaction = require('../models/Transaction');
+const { prisma, sessionHelpers, transactionHelpers, handlePrismaError } = require('../lib/prisma');
 const { authMiddleware, requireClient, requireReader } = require('../middleware/auth');
 const { validateSessionRequest } = require('../middleware/validation');
 
@@ -15,26 +13,40 @@ router.post('/request', authMiddleware, requireClient, validateSessionRequest, a
     const clientId = req.user.userId;
 
     // Validate reader exists and is available
-    const reader = await User.findOne({
-      _id: readerId,
-      role: 'reader',
-      isActive: true
+    const reader = await prisma.user.findUnique({
+      where: {
+        id: readerId,
+        role: 'READER',
+        isActive: true
+      }
     });
 
     if (!reader) {
       return res.status(404).json({ message: 'Reader not found or unavailable' });
     }
 
-    if (!reader.readerSettings.isOnline) {
+    if (!reader.isOnline) {
       return res.status(400).json({ message: 'Reader is currently offline' });
     }
 
     // Get client and check balance
-    const client = await User.findById(clientId);
-    const sessionRate = reader.readerSettings.rates[sessionType];
+    const client = await prisma.user.findUnique({
+      where: { id: clientId }
+    });
 
-    if (!sessionRate) {
-      return res.status(400).json({ message: 'Invalid session type for this reader' });
+    let sessionRate;
+    switch (sessionType) {
+      case 'VIDEO':
+        sessionRate = reader.videoRate;
+        break;
+      case 'AUDIO':
+        sessionRate = reader.audioRate;
+        break;
+      case 'CHAT':
+        sessionRate = reader.chatRate;
+        break;
+      default:
+        return res.status(400).json({ message: 'Invalid session type' });
     }
 
     // Check if client has sufficient balance for at least 1 minute
@@ -46,13 +58,14 @@ router.post('/request', authMiddleware, requireClient, validateSessionRequest, a
       });
     }
 
-    // Check for existing pending sessions
-    const existingSession = await Session.findOne({
-      $or: [
-        { clientId, status: 'pending' },
-        { clientId, status: 'active' },
-        { readerId, status: 'active' }
-      ]
+    // Check for existing pending or active sessions
+    const existingSession = await prisma.session.findFirst({
+      where: {
+        OR: [
+          { clientId, status: { in: ['PENDING', 'ACTIVE'] } },
+          { readerId, status: 'ACTIVE' }
+        ]
+      }
     });
 
     if (existingSession) {
@@ -64,30 +77,40 @@ router.post('/request', authMiddleware, requireClient, validateSessionRequest, a
 
     // Create new session
     const sessionId = uuidv4();
-    const session = new Session({
-      sessionId,
-      clientId,
-      readerId,
-      sessionType,
-      rate: sessionRate,
-      status: 'pending'
+    const session = await prisma.session.create({
+      data: {
+        sessionId,
+        clientId,
+        readerId,
+        sessionType,
+        rate: sessionRate,
+        status: 'PENDING'
+      },
+      include: {
+        client: {
+          select: { id: true, name: true, email: true, avatar: true }
+        },
+        reader: {
+          select: { id: true, name: true, email: true, avatar: true }
+        }
+      }
     });
 
-    await session.save();
-
-    // Notify reader via socket.io
-    const io = req.app.get('io');
-    if (io) {
-      io.emit('reader-notification', {
-        readerId,
-        sessionRequest: {
-          sessionId,
-          clientId,
-          sessionType,
-          rate: sessionRate,
-          clientName: client.profile?.name || 'Anonymous Client'
-        }
+    // Notify reader via WebRTC signaling
+    const webrtcSignaling = req.app.get('webrtcSignaling');
+    if (webrtcSignaling) {
+      const notified = webrtcSignaling.notifyReaderOfSessionRequest(readerId, {
+        sessionId,
+        clientId,
+        sessionType,
+        rate: sessionRate,
+        clientName: client.name || 'Anonymous Client',
+        clientAvatar: client.avatar
       });
+
+      if (!notified) {
+        console.log(`Reader ${readerId} not connected to receive session request notification`);
+      }
     }
 
     res.status(201).json({
@@ -95,12 +118,14 @@ router.post('/request', authMiddleware, requireClient, validateSessionRequest, a
       message: 'Session request sent to reader',
       sessionId,
       session: {
-        id: session._id,
+        id: session.id,
         sessionId,
         sessionType,
         rate: sessionRate,
-        status: 'pending',
-        readerName: reader.profile?.name || 'Reader'
+        status: 'PENDING',
+        readerName: reader.name || 'Reader',
+        readerAvatar: reader.avatar,
+        createdAt: session.createdAt
       }
     });
 
@@ -119,24 +144,34 @@ router.post('/:sessionId/accept', authMiddleware, requireReader, async (req, res
     const { sessionId } = req.params;
     const readerId = req.user.userId;
 
-    const session = await Session.findOne({ 
-      sessionId, 
-      readerId,
-      status: 'pending'
-    }).populate('clientId', 'profile.name email balance');
+    const session = await prisma.session.findUnique({ 
+      where: { 
+        sessionId, 
+        readerId,
+        status: 'PENDING'
+      },
+      include: {
+        client: {
+          select: { id: true, name: true, email: true, avatar: true }
+        },
+        reader: {
+          select: { id: true, name: true, email: true, avatar: true }
+        }
+      }
+    });
 
     if (!session) {
       return res.status(404).json({ message: 'Session not found or already processed' });
     }
 
     // Check if reader is still online
-    const reader = await User.findById(readerId);
-    if (!reader.readerSettings.isOnline) {
+    const reader = await prisma.user.findUnique({ id: readerId });
+    if (!reader.isOnline) {
       return res.status(400).json({ message: 'You must be online to accept sessions' });
     }
 
     // Check client still has sufficient balance
-    if (session.clientId.balance < session.rate) {
+    if (session.client.balance < session.rate) {
       session.status = 'cancelled';
       await session.save();
       
@@ -157,7 +192,7 @@ router.post('/:sessionId/accept', authMiddleware, requireReader, async (req, res
       io.emit('session-accepted', {
         sessionId,
         clientId: session.clientId._id,
-        readerName: reader.profile?.name || 'Reader'
+        readerName: reader.name || 'Reader'
       });
     }
 
@@ -168,7 +203,7 @@ router.post('/:sessionId/accept', authMiddleware, requireReader, async (req, res
         sessionId,
         status: 'active',
         startTime: session.startTime,
-        clientName: session.clientId.profile?.name || 'Client',
+        clientName: session.client.name || 'Client',
         rate: session.rate
       }
     });
@@ -188,10 +223,12 @@ router.post('/:sessionId/decline', authMiddleware, requireReader, async (req, re
     const { sessionId } = req.params;
     const readerId = req.user.userId;
 
-    const session = await Session.findOne({ 
-      sessionId, 
-      readerId,
-      status: 'pending'
+    const session = await prisma.session.findUnique({ 
+      where: { 
+        sessionId, 
+        readerId,
+        status: 'PENDING'
+      }
     });
 
     if (!session) {
@@ -235,9 +272,9 @@ router.post('/charge', authMiddleware, async (req, res) => {
       return res.status(400).json({ message: 'Valid sessionId and amount required' });
     }
 
-    const session = await Session.findOne({ sessionId })
-      .populate('clientId', 'balance')
-      .populate('readerId', 'earnings');
+    const session = await prisma.session.findUnique({ sessionId })
+      .populate('client', 'balance')
+      .populate('reader', 'earnings');
 
     if (!session) {
       return res.status(404).json({ message: 'Session not found' });
@@ -258,13 +295,13 @@ router.post('/charge', authMiddleware, async (req, res) => {
     const chargeAmount = amount / 100; // Convert cents to dollars
 
     // Check client balance
-    if (session.clientId.balance < chargeAmount) {
+    if (session.client.balance < chargeAmount) {
       // Insufficient balance - end session
       await endSessionDueToInsufficientFunds(session);
       
       return res.status(400).json({ 
         message: 'Insufficient balance. Session ended.',
-        balance: session.clientId.balance,
+        balance: session.client.balance,
         sessionEnded: true
       });
     }
@@ -273,7 +310,7 @@ router.post('/charge', authMiddleware, async (req, res) => {
     await processSessionCharge(session, chargeAmount);
 
     // Get updated balance
-    const updatedClient = await User.findById(session.clientId._id).select('balance');
+    const updatedClient = await prisma.user.findUnique({ id: session.clientId._id }).select('balance');
 
     res.json({
       success: true,
@@ -297,9 +334,9 @@ router.post('/:sessionId/end', authMiddleware, async (req, res) => {
     const { sessionId } = req.params;
     const userId = req.user.userId;
 
-    const session = await Session.findOne({ sessionId })
-      .populate('clientId', 'profile.name')
-      .populate('readerId', 'profile.name');
+    const session = await prisma.session.findUnique({ sessionId })
+      .populate('client', 'profile.name')
+      .populate('reader', 'profile.name');
 
     if (!session) {
       return res.status(404).json({ message: 'Session not found' });
@@ -386,19 +423,19 @@ router.get('/history', authMiddleware, async (req, res) => {
       if (endDate) query.createdAt.$lte = new Date(endDate);
     }
 
-    const sessions = await Session.find(query)
-      .populate('clientId', 'profile.name email')
-      .populate('readerId', 'profile.name email')
+    const sessions = await prisma.session.find(query)
+      .populate('client', 'profile.name email')
+      .populate('reader', 'profile.name email')
       .sort({ createdAt: -1 })
       .limit(limit * 1)
       .skip((page - 1) * limit)
       .lean();
 
-    const total = await Session.countDocuments(query);
+    const total = await prisma.session.countDocuments(query);
 
     // Format sessions for response
     const formattedSessions = sessions.map(session => ({
-      id: session._id,
+      id: session.id,
       sessionId: session.sessionId,
       sessionType: session.sessionType,
       status: session.status,
@@ -413,13 +450,13 @@ router.get('/history', authMiddleware, async (req, res) => {
       createdAt: session.createdAt,
       client: {
         id: session.clientId._id,
-        name: session.clientId.profile?.name || 'Anonymous',
-        email: session.clientId.email
+        name: session.client.profile?.name || 'Anonymous',
+        email: session.client.email
       },
       reader: {
         id: session.readerId._id,
-        name: session.readerId.profile?.name || 'Reader',
-        email: session.readerId.email
+        name: session.reader.profile?.name || 'Reader',
+        email: session.reader.email
       },
       isClient: session.clientId._id.toString() === userId
     }));
@@ -462,11 +499,14 @@ router.post('/:sessionId/review', authMiddleware, requireClient, async (req, res
       return res.status(400).json({ message: 'Review must be less than 1000 characters' });
     }
 
-    const session = await Session.findOne({
-      sessionId,
-      clientId,
-      status: 'ended'
-    }).populate('readerId');
+    const session = await prisma.session.findUnique({
+      where: { sessionId },
+      include: {
+        reader: {
+          select: { id: true, name: true, email: true, avatar: true }
+        }
+      }
+    });
 
     if (!session) {
       return res.status(404).json({ message: 'Session not found or not eligible for review' });
@@ -482,7 +522,7 @@ router.post('/:sessionId/review', authMiddleware, requireClient, async (req, res
     await session.save();
 
     // Update reader's overall rating
-    const reader = session.readerId;
+    const reader = session.reader;
     await reader.updateRating(rating);
 
     res.json({
@@ -509,15 +549,21 @@ async function processSessionCharge(session, amount) {
   const readerEarnings = amount * 0.70;
 
   // Update client balance
-  await User.findByIdAndUpdate(session.clientId._id, {
-    $inc: { balance: -amount }
+  await prisma.user.update({
+    where: { id: session.clientId._id },
+    data: {
+      balance: { decrement: amount }
+    }
   });
 
   // Update reader earnings
-  await User.findByIdAndUpdate(session.readerId._id, {
-    $inc: { 
-      'earnings.pending': readerEarnings,
-      'earnings.total': readerEarnings
+  await prisma.user.update({
+    where: { id: session.readerId._id },
+    data: {
+      earnings: {
+        pending: { increment: readerEarnings },
+        total: { increment: readerEarnings }
+      }
     }
   });
 

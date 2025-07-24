@@ -1,0 +1,22 @@
+[
+  {
+    "fileName": "main-overview.mdc",
+    "description": "Complete system overview documenting the psychic reading platform architecture, including core components, business logic flow, and key subsystems"
+  },
+  {
+    "fileName": "data-models.mdc",
+    "description": "Detailed documentation of core data models (User, Session, Message, Transaction) and their relationships, including validation rules and business constraints"
+  },
+  {
+    "fileName": "session-billing-algorithm.mdc",
+    "description": "Implementation details of the real-time per-minute billing system, including rate calculation, revenue splitting, and automatic session termination logic"
+  },
+  {
+    "fileName": "webrtc-session-flow.mdc",
+    "description": "Documentation of the WebRTC session lifecycle, including session establishment, state management, participant tracking, and termination conditions"
+  },
+  {
+    "fileName": "financial-processing.mdc",
+    "description": "Detailed documentation of payment processing workflows, including transaction handling, reader payouts, platform fees, and balance management"
+  }
+]

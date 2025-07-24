@@ -1,7 +1,5 @@
 const express = require('express');
-const User = require('../models/User');
-const Session = require('../models/Session');
-const Transaction = require('../models/Transaction');
+const { prisma } = require('../lib/prisma');
 const { authMiddleware, requireReader, requireReaderOrAdmin, optionalAuth } = require('../middleware/auth');
 const { validateProfileUpdate, validateReaderRates } = require('../middleware/validation');
 
@@ -20,62 +18,71 @@ router.get('/readers', optionalAuth, async (req, res) => {
       sortBy = 'rating' 
     } = req.query;
 
-    // Build query
-    const query = { 
-      role: 'reader', 
-      isActive: true 
-    };
+    // Fetch readers from database
+    const allReaders = await prisma.user.findMany({
+      where: {
+        role: 'reader',
+        isActive: true
+      },
+      select: {
+        id: true,
+        profile: true,
+        readerSettings: true,
+        createdAt: true
+      }
+    });
 
+    // In-memory filtering
+    let filtered = allReaders;
     if (specialty) {
-      query['profile.specialties'] = { $in: [specialty] };
+      filtered = filtered.filter(r => Array.isArray(r.profile.specialties) && r.profile.specialties.includes(specialty));
     }
-
     if (minRating) {
-      query['profile.rating'] = { $gte: parseFloat(minRating) };
+      const min = parseFloat(minRating);
+      filtered = filtered.filter(r => (r.profile.rating || 0) >= min);
     }
-
     if (isOnline === 'true') {
-      query['readerSettings.isOnline'] = true;
+      filtered = filtered.filter(r => r.readerSettings.isOnline === true);
     }
-
     if (maxRate) {
-      query['readerSettings.rates.video'] = { $lte: parseFloat(maxRate) };
+      const max = parseFloat(maxRate);
+      filtered = filtered.filter(r => (r.readerSettings.rates?.video || 0) <= max);
     }
 
-    // Build sort
-    let sort = {};
-    switch (sortBy) {
-      case 'rating':
-        sort = { 'profile.rating': -1, 'profile.totalReviews': -1 };
-        break;
-      case 'price_low':
-        sort = { 'readerSettings.rates.video': 1 };
-        break;
-      case 'price_high':
-        sort = { 'readerSettings.rates.video': -1 };
-        break;
-      case 'newest':
-        sort = { createdAt: -1 };
-        break;
-      case 'online':
-        sort = { 'readerSettings.isOnline': -1, 'profile.rating': -1 };
-        break;
-      default:
-        sort = { 'profile.rating': -1 };
-    }
+    // Sort in-memory
+    const sorted = filtered.sort((a, b) => {
+      switch (sortBy) {
+        case 'rating':
+          if ((b.profile.rating || 0) !== (a.profile.rating || 0)) {
+            return (b.profile.rating || 0) - (a.profile.rating || 0);
+          }
+          return (b.profile.totalReviews || 0) - (a.profile.totalReviews || 0);
+        case 'price_low':
+          return (a.readerSettings.rates?.video || 0) - (b.readerSettings.rates?.video || 0);
+        case 'price_high':
+          return (b.readerSettings.rates?.video || 0) - (a.readerSettings.rates?.video || 0);
+        case 'newest':
+          return b.createdAt - a.createdAt;
+        case 'online':
+          if ((b.readerSettings.isOnline ? 1 : 0) !== (a.readerSettings.isOnline ? 1 : 0)) {
+            return (b.readerSettings.isOnline ? 1 : 0) - (a.readerSettings.isOnline ? 1 : 0);
+          }
+          return (b.profile.rating || 0) - (a.profile.rating || 0);
+        default:
+          return (b.profile.rating || 0) - (a.profile.rating || 0);
+      }
+    });
 
-    const readers = await User.find(query)
-      .select('profile readerSettings createdAt')
-      .sort(sort)
-      .limit(limit * 1)
-      .skip((page - 1) * limit)
-      .lean();
-
-    const total = await User.countDocuments(query);
+    // Pagination
+    const total = sorted.length;
+    const currentPage = parseInt(page, 10);
+    const pageSize = parseInt(limit, 10);
+    const start = (currentPage - 1) * pageSize;
+    const pagedReaders = sorted.slice(start, start + pageSize);
 
     // Format reader data for public consumption
-    const formattedReaders = readers.map(reader => ({
-      id: reader._id,
+    const formattedReaders = pagedReaders.map(reader => ({
+      id: reader.id,
       name: reader.profile.name || 'Anonymous Reader',
       avatar: reader.profile.avatar,
       bio: reader.profile.bio,
@@ -91,11 +98,11 @@ router.get('/readers', optionalAuth, async (req, res) => {
       success: true,
       readers: formattedReaders,
       pagination: {
-        currentPage: parseInt(page),
-        totalPages: Math.ceil(total / limit),
+        currentPage,
+        totalPages: Math.ceil(total / pageSize),
         totalReaders: total,
-        hasNext: page * limit < total,
-        hasPrev: page > 1
+        hasNext: currentPage * pageSize < total,
+        hasPrev: currentPage > 1
       }
     });
 
@@ -113,30 +120,46 @@ router.get('/readers/:readerId', optionalAuth, async (req, res) => {
   try {
     const { readerId } = req.params;
 
-    const reader = await User.findOne({
-      _id: readerId,
-      role: 'reader',
-      isActive: true
-    }).select('profile readerSettings createdAt');
+    const reader = await prisma.user.findUnique({
+      where: { id: readerId },
+      select: {
+        id: true,
+        profile: true,
+        readerSettings: true,
+        createdAt: true
+      }
+    });
 
-    if (!reader) {
+    if (!reader || reader.profile.role !== 'reader') {
       return res.status(404).json({ message: 'Reader not found' });
     }
 
-    // Get recent reviews (you might want to create a Review model)
-    const recentSessions = await Session.find({
-      readerId,
-      status: 'ended',
-      rating: { $exists: true },
-      review: { $exists: true, $ne: '' }
-    })
-    .populate('clientId', 'profile.name')
-    .select('rating review createdAt clientId')
-    .sort({ createdAt: -1 })
-    .limit(5);
+    // Get recent reviews from sessions
+    const recentSessions = await prisma.session.findMany({
+      where: {
+        readerId,
+        status: 'ended',
+        rating: { not: null },
+        review: { not: '' }
+      },
+      include: {
+        client: {
+          select: { profile: true }
+        }
+      },
+      orderBy: { createdAt: 'desc' },
+      take: 5
+    });
+
+    const recentReviews = recentSessions.map(session => ({
+      rating: session.rating,
+      review: session.review,
+      clientName: session.client?.profile?.name || 'Anonymous',
+      date: session.createdAt
+    }));
 
     const readerProfile = {
-      id: reader._id,
+      id: reader.id,
       name: reader.profile.name || 'Anonymous Reader',
       avatar: reader.profile.avatar,
       bio: reader.profile.bio,
@@ -146,12 +169,7 @@ router.get('/readers/:readerId', optionalAuth, async (req, res) => {
       isOnline: reader.readerSettings.isOnline || false,
       rates: reader.readerSettings.rates,
       memberSince: reader.createdAt,
-      recentReviews: recentSessions.map(session => ({
-        rating: session.rating,
-        review: session.review,
-        clientName: session.clientId?.profile?.name || 'Anonymous',
-        date: session.createdAt
-      }))
+      recentReviews
     };
 
     res.json({
@@ -174,45 +192,36 @@ router.patch('/profile', authMiddleware, validateProfileUpdate, async (req, res)
     const userId = req.user.userId;
     const updates = req.body;
 
-    // Build update object
-    const updateObj = {};
-    
-    if (updates.name !== undefined) {
-      updateObj['profile.name'] = updates.name;
-    }
-    
-    if (updates.bio !== undefined) {
-      updateObj['profile.bio'] = updates.bio;
-    }
-    
-    if (updates.specialties !== undefined) {
-      updateObj['profile.specialties'] = updates.specialties;
-    }
-
-    if (updates.avatar !== undefined) {
-      updateObj['profile.avatar'] = updates.avatar;
-    }
-
-    const user = await User.findByIdAndUpdate(
-      userId,
-      { $set: updateObj },
-      { new: true, runValidators: true }
-    ).select('-password');
-
-    if (!user) {
+    const existing = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { profile: true, email: true, role: true }
+    });
+    if (!existing) {
       return res.status(404).json({ message: 'User not found' });
     }
+
+    const newProfile = { ...existing.profile };
+    if (updates.name !== undefined) newProfile.name = updates.name;
+    if (updates.bio !== undefined) newProfile.bio = updates.bio;
+    if (updates.specialties !== undefined) newProfile.specialties = updates.specialties;
+    if (updates.avatar !== undefined) newProfile.avatar = updates.avatar;
+
+    const user = await prisma.user.update({
+      where: { id: userId },
+      data: { profile: newProfile },
+      select: {
+        id: true,
+        email: true,
+        role: true,
+        profile: true,
+        readerSettings: true
+      }
+    });
 
     res.json({
       success: true,
       message: 'Profile updated successfully',
-      user: {
-        id: user._id,
-        email: user.email,
-        role: user.role,
-        profile: user.profile,
-        readerSettings: user.readerSettings
-      }
+      user
     });
 
   } catch (error) {
@@ -230,15 +239,21 @@ router.patch('/rates', authMiddleware, requireReader, validateReaderRates, async
     const userId = req.user.userId;
     const { rates } = req.body;
 
-    const user = await User.findByIdAndUpdate(
-      userId,
-      { $set: { 'readerSettings.rates': rates } },
-      { new: true, runValidators: true }
-    ).select('-password');
-
-    if (!user) {
+    const existing = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { readerSettings: true }
+    });
+    if (!existing) {
       return res.status(404).json({ message: 'User not found' });
     }
+
+    const newSettings = { ...existing.readerSettings, rates };
+
+    const user = await prisma.user.update({
+      where: { id: userId },
+      data: { readerSettings: newSettings },
+      select: { readerSettings: true }
+    });
 
     res.json({
       success: true,
@@ -265,20 +280,24 @@ router.patch('/status', authMiddleware, requireReader, async (req, res) => {
       return res.status(400).json({ message: 'isOnline must be a boolean value' });
     }
 
-    const user = await User.findByIdAndUpdate(
-      userId,
-      { 
-        $set: { 
-          'readerSettings.isOnline': isOnline,
-          lastSeen: new Date()
-        }
-      },
-      { new: true }
-    ).select('-password');
-
-    if (!user) {
+    const existing = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { readerSettings: true }
+    });
+    if (!existing) {
       return res.status(404).json({ message: 'User not found' });
     }
+
+    const newSettings = { ...existing.readerSettings, isOnline };
+
+    const user = await prisma.user.update({
+      where: { id: userId },
+      data: { 
+        readerSettings: newSettings,
+        lastSeen: new Date()
+      },
+      select: { readerSettings: true }
+    });
 
     res.json({
       success: true,
@@ -301,8 +320,10 @@ router.get('/earnings', authMiddleware, requireReader, async (req, res) => {
     const userId = req.user.userId;
     const { period = '30d' } = req.query;
 
-    const user = await User.findById(userId).select('earnings');
-    
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { earnings: true }
+    });
     if (!user) {
       return res.status(404).json({ message: 'User not found' });
     }
@@ -326,26 +347,27 @@ router.get('/earnings', authMiddleware, requireReader, async (req, res) => {
         startDate.setDate(startDate.getDate() - 30);
     }
 
-    // Get sessions for the period
-    const sessions = await Session.find({
-      readerId: userId,
-      status: 'ended',
-      endTime: { $gte: startDate }
-    }).select('readerEarnings endTime');
+    const sessions = await prisma.session.findMany({
+      where: {
+        readerId: userId,
+        status: 'ended',
+        endTime: { gte: startDate }
+      },
+      select: { readerEarnings: true, endTime: true }
+    });
+    const periodEarnings = sessions.reduce((sum, s) => sum + (s.readerEarnings || 0), 0);
 
-    const periodEarnings = sessions.reduce((sum, session) => sum + (session.readerEarnings || 0), 0);
-
-    // Get today's earnings
     const todayStart = new Date();
     todayStart.setHours(0, 0, 0, 0);
-    
-    const todaySessions = await Session.find({
-      readerId: userId,
-      status: 'ended',
-      endTime: { $gte: todayStart }
-    }).select('readerEarnings');
-
-    const todayEarnings = todaySessions.reduce((sum, session) => sum + (session.readerEarnings || 0), 0);
+    const todaySessions = await prisma.session.findMany({
+      where: {
+        readerId: userId,
+        status: 'ended',
+        endTime: { gte: todayStart }
+      },
+      select: { readerEarnings: true }
+    });
+    const todayEarnings = todaySessions.reduce((sum, s) => sum + (s.readerEarnings || 0), 0);
 
     res.json({
       success: true,
@@ -377,11 +399,13 @@ router.get('/stats', authMiddleware, async (req, res) => {
     let stats = {};
 
     if (userRole === 'client') {
-      // Client statistics
-      const sessions = await Session.find({ clientId: userId });
-      const totalSpent = sessions.reduce((sum, session) => sum + (session.totalCost || 0), 0);
+      const sessions = await prisma.session.findMany({
+        where: { clientId: userId },
+        select: { totalCost: true, duration: true }
+      });
+      const totalSpent = sessions.reduce((sum, s) => sum + (s.totalCost || 0), 0);
       const totalSessions = sessions.length;
-      const totalMinutes = sessions.reduce((sum, session) => sum + (session.duration || 0), 0) / 60;
+      const totalMinutes = sessions.reduce((sum, s) => sum + (s.duration || 0), 0) / 60;
 
       stats = {
         totalSessions,
@@ -392,14 +416,16 @@ router.get('/stats', authMiddleware, async (req, res) => {
       };
 
     } else if (userRole === 'reader') {
-      // Reader statistics
-      const sessions = await Session.find({ readerId: userId, status: 'ended' });
-      const totalEarnings = sessions.reduce((sum, session) => sum + (session.readerEarnings || 0), 0);
+      const sessions = await prisma.session.findMany({
+        where: { readerId: userId, status: 'ended' },
+        select: { readerEarnings: true, duration: true, rating: true }
+      });
+      const totalEarnings = sessions.reduce((sum, s) => sum + (s.readerEarnings || 0), 0);
       const totalSessions = sessions.length;
-      const totalMinutes = sessions.reduce((sum, session) => sum + (session.duration || 0), 0) / 60;
-      const ratedSessions = sessions.filter(s => s.rating);
-      const averageRating = ratedSessions.length > 0 
-        ? ratedSessions.reduce((sum, s) => sum + s.rating, 0) / ratedSessions.length 
+      const totalMinutes = sessions.reduce((sum, s) => sum + (s.duration || 0), 0) / 60;
+      const ratedSessions = sessions.filter(s => s.rating != null);
+      const averageRating = ratedSessions.length > 0
+        ? ratedSessions.reduce((sum, s) => sum + (s.rating || 0), 0) / ratedSessions.length
         : 0;
 
       stats = {

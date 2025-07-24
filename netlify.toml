@@ -1,7 +1,21 @@
 [build]
-  command = "npm run netlify-build"
+  command = "npm run prisma:generate && npm run netlify-build"
   publish = "client/dist"
   functions = "netlify/functions"
+
+[build.environment]
+  DATABASE_URL = "$DATABASE_URL"
+  SHADOW_DATABASE_URL = "$SHADOW_DATABASE_URL"
+  ABLY_API_KEY = "$ABLY_API_KEY"
+
+[functions]
+  external_node_modules = ["@prisma/client"]
+  node_bundler = "esbuild"
+
+[functions.environment]
+  DATABASE_URL = "$DATABASE_URL"
+  SHADOW_DATABASE_URL = "$SHADOW_DATABASE_URL"
+  ABLY_API_KEY = "$ABLY_API_KEY"
 
 [dev]
   command = "npm run dev"

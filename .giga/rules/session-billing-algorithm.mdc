@@ -1,0 +1,48 @@
+---
+description: Implements real-time per-minute billing system for psychic reading sessions with revenue splitting and termination logic
+globs: server/utils/billing.js,server/routes/sessions.js,server/models/Transaction.js,server/models/Session.js
+alwaysApply: false
+---
+
+
+# session-billing-algorithm
+
+Key billing system components (Importance: 95):
+
+1. Per-Minute Rate Calculation
+- Base rates by session type:
+  - Video: $3.99/min
+  - Audio: $2.99/min 
+  - Chat: $1.99/min
+- Custom reader-specific rate multipliers
+- Real-time balance monitoring with automatic termination
+- Pre-session minimum balance verification
+
+2. Revenue Distribution (Importance: 90)
+- 70% reader / 30% platform revenue split
+- Atomic transaction processing for payment splits
+- Pending earnings accumulation for readers
+- Daily automated payouts above $15 threshold
+- Stripe fee handling (2.9% + $0.30)
+
+3. Session Control Logic (Importance: 85)
+- Continuous balance monitoring per billing cycle
+- Automatic termination on insufficient funds
+- Low balance warnings at 5-minute threshold
+- Grace period handling for connection issues
+
+4. Transaction Management (Importance: 80)
+- Multi-stage billing state machine
+- Pre-authorization holds for minimum duration
+- Rollback mechanism for failed charges
+- Detailed transaction audit trail maintenance
+
+File Paths:
+- server/utils/billing.js: Core billing engine
+- server/routes/sessions.js: Session management integration
+- server/models/Transaction.js: Transaction state handling
+- server/models/Session.js: Session duration tracking
+
+$END$
+
+ If you're using this file in context, clearly say in italics in one small line that "Context added by Giga session-billing-algorithm" along with specifying exactly what information was used from this file in a human-friendly way, instead of using kebab-case use normal sentence case.

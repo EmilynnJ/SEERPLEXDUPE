@@ -1,6 +1,4 @@
-const User = require('../models/User');
-const Session = require('../models/Session');
-const Transaction = require('../models/Transaction');
+const { prisma } = require('../lib/prisma');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 class BillingManager {
@@ -41,7 +39,6 @@ class BillingManager {
   // Stop billing for a session
   stopSessionBilling(sessionId) {
     const billingData = this.activeBillingIntervals.get(sessionId);
-    
     if (billingData) {
       clearInterval(billingData.interval);
       this.activeBillingIntervals.delete(sessionId);
@@ -54,9 +51,11 @@ class BillingManager {
     try {
       // Get current session and user data
       const [session, client, reader] = await Promise.all([
-        Session.findOne({ sessionId, status: 'active' }),
-        User.findById(clientId),
-        User.findById(readerId)
+        prisma.session.findFirst({
+          where: { sessionId, status: 'active' }
+        }),
+        prisma.user.findUnique({ where: { id: clientId } }),
+        prisma.user.findUnique({ where: { id: readerId } })
       ]);
 
       if (!session || !client || !reader) {
@@ -79,7 +78,6 @@ class BillingManager {
       await this.processCharge(client, reader, session, ratePerMinute, platformFee, readerEarnings);
 
       console.log(`Billed $${ratePerMinute} for session ${sessionId}`);
-
     } catch (error) {
       console.error('Minute billing error:', error);
       throw error;
@@ -88,69 +86,82 @@ class BillingManager {
 
   // Process the actual charge
   async processCharge(client, reader, session, amount, platformFee, readerEarnings) {
-    // Start a transaction to ensure consistency
-    const clientUpdate = User.findByIdAndUpdate(
-      client._id,
-      { $inc: { balance: -amount } },
-      { new: true }
-    );
+    // Execute all updates and transaction record in a single database transaction
+    const balanceBefore = client.balance;
+    const balanceAfter = balanceBefore - amount;
 
-    const readerUpdate = User.findByIdAndUpdate(
-      reader._id,
-      { 
-        $inc: { 
-          'earnings.pending': readerEarnings,
-          'earnings.total': readerEarnings
+    const [updatedClient] = await prisma.$transaction([
+      prisma.user.update({
+        where: { id: client.id },
+        data: { balance: { decrement: amount } }
+      }),
+      prisma.user.update({
+        where: { id: reader.id },
+        data: {
+          earnings: {
+            // assuming earnings is JSON in Prisma schema
+            set: {
+              ...reader.earnings,
+              pending: (reader.earnings?.pending || 0) + readerEarnings,
+              total: (reader.earnings?.total || 0) + readerEarnings
+            }
+          }
         }
-      },
-      { new: true }
-    );
-
-    const sessionUpdate = session.addBilling(amount, 'Per-minute session charge');
-
-    // Execute all updates
-    const [updatedClient] = await Promise.all([clientUpdate, readerUpdate, sessionUpdate]);
-
-    // Create transaction record
-    const transaction = new Transaction({
-      userId: client._id,
-      sessionId: session._id,
-      type: 'charge',
-      amount,
-      status: 'succeeded',
-      description: `Session charge - ${session.sessionType}`,
-      balanceBefore: updatedClient.balance + amount,
-      balanceAfter: updatedClient.balance,
-      fees: {
-        platformFee,
-        totalFees: platformFee
-      },
-      metadata: {
-        sessionType: session.sessionType,
-        readerId: reader._id,
-        clientId: client._id,
-        readerEarnings
-      }
-    });
-
-    await transaction.save();
+      }),
+      prisma.session.update({
+        where: { id: session.id },
+        data: {
+          totalCost: { increment: amount },
+          platformFee: { increment: platformFee },
+          readerEarnings: { increment: readerEarnings }
+        }
+      }),
+      prisma.transaction.create({
+        data: {
+          userId: client.id,
+          sessionId: session.id,
+          type: 'charge',
+          amount,
+          status: 'succeeded',
+          description: `Session charge - ${session.sessionType}`,
+          balanceBefore,
+          balanceAfter,
+          fees: {
+            stripeFee: 0,
+            platformFee,
+            totalFees: platformFee
+          },
+          metadata: {
+            sessionType: session.sessionType,
+            readerId: reader.id,
+            clientId: client.id,
+            readerEarnings
+          }
+        }
+      })
+    ]);
 
     return updatedClient;
   }
 
   // End session due to insufficient funds
   async endSessionDueToInsufficientFunds(session) {
-    session.status = 'ended';
-    session.endTime = new Date();
-    
-    if (session.startTime) {
-      session.duration = Math.floor((session.endTime - session.startTime) / 1000);
-    }
-    
-    session.notes = session.notes || {};
-    session.notes.admin = 'Session ended due to insufficient client balance';
-    
-    await session.save();
+    const endTime = new Date();
+    const startTime = new Date(session.startTime);
+    const duration = session.startTime ? Math.floor((endTime - startTime) / 1000) : 0;
+
+    await prisma.session.update({
+      where: { id: session.id },
+      data: {
+        status: 'ended',
+        endTime,
+        duration,
+        notes: {
+          // overwrite or set admin note
+          admin: 'Session ended due to insufficient client balance'
+        }
+      }
+    });
 
     console.log(`Session ${session.sessionId} ended due to insufficient balance`);
   }
@@ -161,11 +172,16 @@ class BillingManager {
       console.log('Processing automatic payouts...');
 
       // Find readers eligible for payout
-      const eligibleReaders = await User.find({
-        role: 'reader',
-        'earnings.pending': { $gte: this.MINIMUM_PAYOUT },
-        stripeAccountId: { $exists: true, $ne: null },
-        isActive: true
+      const eligibleReaders = await prisma.user.findMany({
+        where: {
+          role: 'reader',
+          isActive: true,
+          stripeAccountId: { not: null },
+          // assuming earnings is stored as JSON or separate fields
+          AND: [
+            { earnings: { path: ['pending'], gte: this.MINIMUM_PAYOUT } }
+          ]
+        }
       });
 
       const results = [];
@@ -174,18 +190,18 @@ class BillingManager {
         try {
           const payoutResult = await this.processReaderPayout(reader);
           results.push({
-            readerId: reader._id,
+            readerId: reader.id,
             email: reader.email,
             amount: payoutResult.amount,
             status: 'success',
             transferId: payoutResult.transferId
           });
         } catch (error) {
-          console.error(`Payout failed for reader ${reader._id}:`, error);
+          console.error(`Payout failed for reader ${reader.id}:`, error);
           results.push({
-            readerId: reader._id,
+            readerId: reader.id,
             email: reader.email,
-            amount: reader.earnings.pending,
+            amount: reader.earnings?.pending || 0,
             status: 'failed',
             error: error.message
           });
@@ -194,7 +210,6 @@ class BillingManager {
 
       console.log(`Processed ${results.filter(r => r.status === 'success').length} automatic payouts`);
       return results;
-
     } catch (error) {
       console.error('Automatic payout processing error:', error);
       throw error;
@@ -203,11 +218,10 @@ class BillingManager {
 
   // Process individual reader payout
   async processReaderPayout(reader) {
-    const payoutAmount = reader.earnings.pending;
+    const payoutAmount = reader.earnings?.pending || 0;
 
     // Check Stripe account status
     const account = await stripe.accounts.retrieve(reader.stripeAccountId);
-    
     if (!account.payouts_enabled) {
       throw new Error('Stripe account not ready for payouts');
     }
@@ -218,7 +232,7 @@ class BillingManager {
       currency: 'usd',
       destination: reader.stripeAccountId,
       metadata: {
-        userId: reader._id.toString(),
+        userId: reader.id.toString(),
         type: 'automatic_payout',
         originalAmount: payoutAmount.toString()
       },
@@ -226,26 +240,33 @@ class BillingManager {
     });
 
     // Update reader earnings
-    reader.earnings.pending = 0;
-    reader.earnings.paid += payoutAmount;
-    reader.earnings.lastPayout = new Date();
-    await reader.save();
+    const newEarnings = {
+      ...reader.earnings,
+      pending: 0,
+      paid: (reader.earnings?.paid || 0) + payoutAmount,
+      lastPayout: new Date()
+    };
 
-    // Create transaction record
-    const transaction = new Transaction({
-      userId: reader._id,
-      type: 'payout',
-      amount: payoutAmount,
-      stripeTransferId: transfer.id,
-      status: 'succeeded',
-      description: `Automatic payout - $${payoutAmount.toFixed(2)}`,
-      metadata: {
-        automaticPayout: true,
-        stripeAccountId: reader.stripeAccountId
-      }
+    await prisma.user.update({
+      where: { id: reader.id },
+      data: { earnings: { set: newEarnings } }
     });
 
-    await transaction.save();
+    // Create transaction record
+    await prisma.transaction.create({
+      data: {
+        userId: reader.id,
+        type: 'payout',
+        amount: payoutAmount,
+        stripeTransferId: transfer.id,
+        status: 'succeeded',
+        description: `Automatic payout - $${payoutAmount.toFixed(2)}`,
+        metadata: {
+          automaticPayout: true,
+          stripeAccountId: reader.stripeAccountId
+        }
+      }
+    });
 
     return {
       amount: payoutAmount,
@@ -256,32 +277,35 @@ class BillingManager {
   // Add funds to client balance
   async addFundsToClient(clientId, amount, paymentIntentId) {
     try {
-      const client = await User.findById(clientId);
+      const client = await prisma.user.findUnique({ where: { id: clientId } });
       if (!client) {
         throw new Error('Client not found');
       }
 
       const previousBalance = client.balance;
-      client.balance += amount;
-      await client.save();
+      const newBalance = previousBalance + amount;
 
-      // Create transaction record
-      const transaction = new Transaction({
-        userId: clientId,
-        type: 'deposit',
-        amount,
-        stripePaymentIntentId: paymentIntentId,
-        status: 'succeeded',
-        description: `Balance top-up - $${amount.toFixed(2)}`,
-        balanceBefore: previousBalance,
-        balanceAfter: client.balance
+      await prisma.user.update({
+        where: { id: clientId },
+        data: { balance: newBalance }
       });
 
-      await transaction.save();
+      // Create transaction record
+      await prisma.transaction.create({
+        data: {
+          userId: clientId,
+          type: 'deposit',
+          amount,
+          stripePaymentIntentId: paymentIntentId,
+          status: 'succeeded',
+          description: `Balance top-up - $${amount.toFixed(2)}`,
+          balanceBefore: previousBalance,
+          balanceAfter: newBalance
+        }
+      });
 
       console.log(`Added $${amount} to client ${client.email} balance`);
-      return client;
-
+      return { ...client, balance: newBalance };
     } catch (error) {
       console.error('Add funds error:', error);
       throw error;
@@ -292,7 +316,6 @@ class BillingManager {
   async getBillingStatistics(period = '30d') {
     try {
       let startDate = new Date();
-      
       switch (period) {
         case '7d':
           startDate.setDate(startDate.getDate() - 7);
@@ -308,67 +331,56 @@ class BillingManager {
           break;
       }
 
-      const [sessionStats, transactionStats] = await Promise.all([
-        Session.aggregate([
-          {
-            $match: {
-              status: 'ended',
-              endTime: { $gte: startDate }
-            }
-          },
-          {
-            $group: {
-              _id: null,
-              totalSessions: { $sum: 1 },
-              totalRevenue: { $sum: '$totalCost' },
-              totalDuration: { $sum: '$duration' },
-              averageSessionCost: { $avg: '$totalCost' },
-              averageSessionDuration: { $avg: '$duration' }
-            }
-          }
-        ]),
-        Transaction.aggregate([
-          {
-            $match: {
-              status: 'succeeded',
-              createdAt: { $gte: startDate }
-            }
-          },
-          {
-            $group: {
-              _id: '$type',
-              count: { $sum: 1 },
-              totalAmount: { $sum: '$amount' }
-            }
-          }
-        ])
-      ]);
+      // Session statistics
+      const sessionStats = await prisma.session.aggregate({
+        where: {
+          status: 'ended',
+          endTime: { gte: startDate }
+        },
+        _count: { id: true },
+        _sum: { totalCost: true, duration: true },
+        _avg: { totalCost: true, duration: true }
+      });
 
-      const stats = sessionStats[0] || {
-        totalSessions: 0,
-        totalRevenue: 0,
-        totalDuration: 0,
-        averageSessionCost: 0,
-        averageSessionDuration: 0
-      };
+      const totalSessions = sessionStats._count.id || 0;
+      const totalRevenue = sessionStats._sum.totalCost || 0;
+      const totalDuration = sessionStats._sum.duration || 0;
+      const averageSessionCost = sessionStats._avg.totalCost || 0;
+      const averageSessionDuration = sessionStats._avg.duration || 0;
+
+      // Transaction statistics
+      const transactionStats = await prisma.transaction.groupBy({
+        by: ['type'],
+        where: {
+          status: 'succeeded',
+          createdAt: { gte: startDate }
+        },
+        _count: { type: true },
+        _sum: { amount: true }
+      });
 
       const transactionBreakdown = {};
       transactionStats.forEach(stat => {
-        transactionBreakdown[stat._id] = {
-          count: stat.count,
-          totalAmount: stat.totalAmount
+        transactionBreakdown[stat.type] = {
+          count: stat._count.type,
+          totalAmount: stat._sum.amount || 0
         };
       });
 
       return {
         period,
-        sessions: stats,
+        sessions: {
+          totalSessions,
+          totalRevenue,
+          totalDuration,
+          averageSessionCost,
+          averageSessionDuration
+        },
         transactions: transactionBreakdown,
-        platformRevenue: stats.totalRevenue * this.PLATFORM_FEE_RATE,
-        readerEarnings: stats.totalRevenue * this.READER_SHARE_RATE,
+        platformRevenue: totalRevenue * this.PLATFORM_FEE_RATE,
+        readerEarnings: totalRevenue * this.READER_SHARE_RATE,
         activeBillingSessions: this.activeBillingIntervals.size
       };
-
     } catch (error) {
       console.error('Get billing statistics error:', error);
       throw error;
@@ -378,7 +390,6 @@ class BillingManager {
   // Get active billing sessions
   getActiveBillingSessions() {
     const sessions = [];
-    
     for (const [sessionId, data] of this.activeBillingIntervals) {
       sessions.push({
         sessionId,
@@ -389,18 +400,15 @@ class BillingManager {
         duration: Math.floor((new Date() - data.startTime) / 1000)
       });
     }
-    
     return sessions;
   }
 
   // Clean up billing for ended sessions
   cleanup() {
     console.log(`Cleaning up ${this.activeBillingIntervals.size} active billing intervals`);
-    
     for (const [sessionId, data] of this.activeBillingIntervals) {
       clearInterval(data.interval);
     }
-    
     this.activeBillingIntervals.clear();
   }
 }
@@ -411,7 +419,6 @@ const billingManager = new BillingManager();
 // Schedule automatic payouts (run daily at 2 AM)
 if (process.env.NODE_ENV === 'production') {
   const cron = require('node-cron');
-  
   cron.schedule('0 2 * * *', async () => {
     try {
       console.log('Running scheduled automatic payouts...');

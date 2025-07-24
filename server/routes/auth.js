@@ -1,6 +1,7 @@
 const express = require('express');
 const jwt = require('jsonwebtoken');
-const User = require('../models/User');
+const bcrypt = require('bcryptjs');
+const { prisma, userHelpers, handlePrismaError } = require('../lib/prisma');
 const { authMiddleware, rateLimitSensitive } = require('../middleware/auth');
 const { validateUserRegistration, validateUserLogin } = require('../middleware/validation');
 
@@ -15,38 +16,49 @@ const generateToken = (userId, role) => {
   );
 };
 
-// Register new user
+// Register new user (clients only - readers created by admin)
 router.post('/signup', rateLimitSensitive, validateUserRegistration, async (req, res) => {
   try {
-    const { email, password, role = 'client' } = req.body;
+    const { email, password, name } = req.body;
 
     // Check if user already exists
-    const existingUser = await User.findOne({ email });
+    const existingUser = await userHelpers.findByEmail(email);
     if (existingUser) {
       return res.status(400).json({ message: 'User with this email already exists' });
     }
 
-    // Create new user
-    const user = new User({
-      email,
-      password,
-      role
-    });
+    // Hash password
+    const hashedPassword = await bcrypt.hash(password, 12);
 
-    await user.save();
+    // Create new client user
+    const userData = {
+      email,
+      password: hashedPassword,
+      role: 'CLIENT',
+      name: name || null,
+      balance: 0,
+      totalEarnings: 0,
+      pendingEarnings: 0,
+      paidEarnings: 0,
+      isVerified: false,
+      isActive: true,
+      preferences: {}
+    };
+
+    const user = await userHelpers.createUser(userData);
 
     // Generate token
-    const token = generateToken(user._id, user.role);
+    const token = generateToken(user.id, user.role);
 
     // Return user data without password
-    const userData = {
-      id: user._id,
+    const userResponse = {
+      id: user.id,
       email: user.email,
       role: user.role,
-      profile: user.profile,
+      name: user.name,
+      avatar: user.avatar,
+      bio: user.bio,
       balance: user.balance,
-      earnings: user.earnings,
-      readerSettings: user.readerSettings,
       isVerified: user.isVerified,
       createdAt: user.createdAt
     };
@@ -55,13 +67,13 @@ router.post('/signup', rateLimitSensitive, validateUserRegistration, async (req,
       success: true,
       message: 'Account created successfully',
       token,
-      user: userData
+      user: userResponse
     });
 
   } catch (error) {
     console.error('Signup error:', error);
     
-    if (error.code === 11000) {
+    if (error.message.includes('Unique constraint failed')) {
       return res.status(400).json({ message: 'Email already exists' });
     }
     
@@ -78,7 +90,10 @@ router.post('/login', rateLimitSensitive, validateUserLogin, async (req, res) =>
     const { email, password } = req.body;
 
     // Find user by email
-    const user = await User.findOne({ email }).select('+password');
+    const user = await prisma.user.findUnique({
+      where: { email }
+    });
+
     if (!user) {
       return res.status(400).json({ message: 'Invalid email or password' });
     }
@@ -89,36 +104,44 @@ router.post('/login', rateLimitSensitive, validateUserLogin, async (req, res) =>
     }
 
     // Verify password
-    const isPasswordValid = await user.comparePassword(password);
+    const isPasswordValid = await bcrypt.compare(password, user.password);
     if (!isPasswordValid) {
       return res.status(400).json({ message: 'Invalid email or password' });
     }
 
     // Update last seen
-    user.lastSeen = new Date();
-    await user.save();
+    await userHelpers.updateLastSeen(user.id);
 
     // Generate token
-    const token = generateToken(user._id, user.role);
+    const token = generateToken(user.id, user.role);
 
     // Return user data without password
-    const userData = {
-      id: user._id,
+    const userResponse = {
+      id: user.id,
       email: user.email,
       role: user.role,
-      profile: user.profile,
+      name: user.name,
+      avatar: user.avatar,
+      bio: user.bio,
+      specialties: user.specialties,
+      rating: user.rating,
       balance: user.balance,
-      earnings: user.earnings,
-      readerSettings: user.readerSettings,
+      totalEarnings: user.totalEarnings,
+      pendingEarnings: user.pendingEarnings,
+      videoRate: user.videoRate,
+      audioRate: user.audioRate,
+      chatRate: user.chatRate,
+      isOnline: user.isOnline,
       isVerified: user.isVerified,
-      lastSeen: user.lastSeen
+      lastSeen: user.lastSeen,
+      preferences: user.preferences
     };
 
     res.json({
       success: true,
       message: 'Login successful',
       token,
-      user: userData
+      user: userResponse
     });
 
   } catch (error) {
@@ -133,26 +156,40 @@ router.post('/login', rateLimitSensitive, validateUserLogin, async (req, res) =>
 // Get current user
 router.get('/me', authMiddleware, async (req, res) => {
   try {
-    const user = await User.findById(req.user.userId).select('-password');
+    const user = await prisma.user.findUnique({
+      where: { id: req.user.userId }
+    });
     
     if (!user) {
       return res.status(404).json({ message: 'User not found' });
     }
 
+    // Return user data without password
+    const userResponse = {
+      id: user.id,
+      email: user.email,
+      role: user.role,
+      name: user.name,
+      avatar: user.avatar,
+      bio: user.bio,
+      specialties: user.specialties,
+      rating: user.rating,
+      balance: user.balance,
+      totalEarnings: user.totalEarnings,
+      pendingEarnings: user.pendingEarnings,
+      videoRate: user.videoRate,
+      audioRate: user.audioRate,
+      chatRate: user.chatRate,
+      isOnline: user.isOnline,
+      isVerified: user.isVerified,
+      lastSeen: user.lastSeen,
+      preferences: user.preferences,
+      availability: user.availability
+    };
+
     res.json({
       success: true,
-      user: {
-        id: user._id,
-        email: user.email,
-        role: user.role,
-        profile: user.profile,
-        balance: user.balance,
-        earnings: user.earnings,
-        readerSettings: user.readerSettings,
-        isVerified: user.isVerified,
-        lastSeen: user.lastSeen,
-        preferences: user.preferences
-      }
+      user: userResponse
     });
 
   } catch (error) {
@@ -167,27 +204,33 @@ router.get('/me', authMiddleware, async (req, res) => {
 // Refresh token
 router.post('/refresh', authMiddleware, async (req, res) => {
   try {
-    const user = await User.findById(req.user.userId).select('-password');
+    const user = await prisma.user.findUnique({
+      where: { id: req.user.userId }
+    });
     
     if (!user || !user.isActive) {
       return res.status(401).json({ message: 'User not found or inactive' });
     }
 
     // Generate new token
-    const token = generateToken(user._id, user.role);
+    const token = generateToken(user.id, user.role);
+
+    const userResponse = {
+      id: user.id,
+      email: user.email,
+      role: user.role,
+      name: user.name,
+      avatar: user.avatar,
+      balance: user.balance,
+      totalEarnings: user.totalEarnings,
+      pendingEarnings: user.pendingEarnings,
+      isVerified: user.isVerified
+    };
 
     res.json({
       success: true,
       token,
-      user: {
-        id: user._id,
-        email: user.email,
-        role: user.role,
-        profile: user.profile,
-        balance: user.balance,
-        earnings: user.earnings,
-        readerSettings: user.readerSettings
-      }
+      user: userResponse
     });
 
   } catch (error) {
@@ -200,17 +243,22 @@ router.post('/refresh', authMiddleware, async (req, res) => {
 router.post('/logout', authMiddleware, async (req, res) => {
   try {
     // Update user's last seen and set offline if reader
-    const user = await User.findById(req.user.userId);
-    
-    if (user) {
-      user.lastSeen = new Date();
-      
-      if (user.role === 'reader') {
-        user.readerSettings.isOnline = false;
-      }
-      
-      await user.save();
+    const updateData = {
+      lastSeen: new Date()
+    };
+
+    const user = await prisma.user.findUnique({
+      where: { id: req.user.userId }
+    });
+
+    if (user && user.role === 'READER') {
+      updateData.isOnline = false;
     }
+
+    await prisma.user.update({
+      where: { id: req.user.userId },
+      data: updateData
+    });
 
     res.json({
       success: true,
@@ -232,7 +280,7 @@ router.post('/forgot-password', rateLimitSensitive, async (req, res) => {
       return res.status(400).json({ message: 'Email is required' });
     }
 
-    const user = await User.findOne({ email });
+    const user = await userHelpers.findByEmail(email);
     
     // Always return success to prevent email enumeration
     res.json({

@@ -4,17 +4,20 @@
   "description": "SoulSeer Backend API",
   "main": "index.js",
   "scripts": {
-    "dev": "nodemon index.js",
-    "start": "node index.js"
+    "dev": "prisma generate && nodemon index.js",
+    "start": "prisma generate && node index.js",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate deploy"
   },
   "dependencies": {
-    "express": "^4.18.2",
-    "socket.io": "^4.7.4",
+    "@prisma/client": "^5.12.0",
+    "bcryptjs": "^2.4.3",
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
-    "bcryptjs": "^2.4.3",
+    "express": "^4.18.2",
     "jsonwebtoken": "^9.0.2",
-    "mongoose": "^8.0.3",
+    "prisma": "^5.12.0",
+    "socket.io": "^4.7.4",
     "stripe": "^14.12.0",
     "validator": "^13.11.0",
     "uuid": "^9.0.1"

@@ -1,10 +1,14 @@
 const express = require('express');
-const Message = require('../models/Message');
-const User = require('../models/User');
+const router = express.Router();
+const { prisma, messageHelpers } = require('../lib/prisma');
 const { authMiddleware } = require('../middleware/auth');
 const { validateMessage } = require('../middleware/validation');
 
-const router = express.Router();
+// Helper to generate conversation ID
+function generateConversationId(id1, id2) {
+  const ids = [id1, id2].map(String).sort();
+  return `${ids[0]}_${ids[1]}`;
+}
 
 // Send a message
 router.post('/send', authMiddleware, validateMessage, async (req, res) => {
@@ -13,23 +17,23 @@ router.post('/send', authMiddleware, validateMessage, async (req, res) => {
     const senderId = req.user.userId;
 
     // Validate receiver exists
-    const receiver = await User.findById(receiverId);
+    const receiver = await prisma.user.findUnique({ where: { id: receiverId } });
     if (!receiver) {
       return res.status(404).json({ message: 'Receiver not found' });
     }
 
-    // Check if user is trying to message themselves
+    // Cannot message yourself
     if (senderId === receiverId) {
       return res.status(400).json({ message: 'Cannot send message to yourself' });
     }
 
     // Generate conversation ID
-    const conversationId = Message.generateConversationId(senderId, receiverId);
+    const conversationId = generateConversationId(senderId, receiverId);
 
-    // Create message
-    const message = new Message({
+    // Create message via Prisma
+    const message = await messageHelpers.createMessage({
       senderId,
-      receiverId,
+      recipientId: receiverId,
       sessionId,
       conversationId,
       content,
@@ -40,26 +44,21 @@ router.post('/send', authMiddleware, validateMessage, async (req, res) => {
       }
     });
 
-    await message.save();
-
-    // Populate sender info for response
-    await message.populate('senderId', 'profile.name profile.avatar role');
-
     // Emit real-time message via socket.io
     const io = req.app.get('io');
     if (io) {
       io.emit('new-message', {
         receiverId,
         message: {
-          id: message._id,
+          id: message.id,
           conversationId,
           content: message.content,
           messageType: message.messageType,
           sender: {
-            id: message.senderId._id,
-            name: message.senderId.profile?.name || 'Anonymous',
-            avatar: message.senderId.profile?.avatar,
-            role: message.senderId.role
+            id: message.sender.id,
+            name: message.sender.profile?.name || 'Anonymous',
+            avatar: message.sender.profile?.avatar,
+            role: message.sender.role
           },
           createdAt: message.createdAt
         }
@@ -69,22 +68,21 @@ router.post('/send', authMiddleware, validateMessage, async (req, res) => {
     res.status(201).json({
       success: true,
       message: {
-        id: message._id,
+        id: message.id,
         conversationId,
         content: message.content,
         messageType: message.messageType,
         createdAt: message.createdAt,
         sender: {
-          id: message.senderId._id,
-          name: message.senderId.profile?.name || 'Anonymous',
-          avatar: message.senderId.profile?.avatar
+          id: message.sender.id,
+          name: message.sender.profile?.name || 'Anonymous',
+          avatar: message.sender.profile?.avatar
         }
       }
     });
-
   } catch (error) {
     console.error('Send message error:', error);
-    res.status(500).json({ 
+    res.status(500).json({
       message: 'Failed to send message',
       error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
@@ -96,38 +94,50 @@ router.get('/conversation/:conversationId', authMiddleware, async (req, res) => 
   try {
     const { conversationId } = req.params;
     const userId = req.user.userId;
-    const { page = 1, limit = 50, before, after } = req.query;
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 50;
+    const before = req.query.before;
+    const after = req.query.after;
 
-    // Verify user is part of this conversation
-    const [userId1, userId2] = conversationId.split('_');
-    if (userId !== userId1 && userId !== userId2) {
+    // Authorization check
+    const [u1, u2] = conversationId.split('_');
+    if (userId !== u1 && userId !== u2) {
       return res.status(403).json({ message: 'Not authorized to view this conversation' });
     }
 
-    const messages = await Message.getConversation(conversationId, {
-      page: parseInt(page),
-      limit: parseInt(limit),
-      before,
-      after
+    // Build query filters
+    const where = { conversationId, isDeleted: false };
+    if (before) where.createdAt = { ...where.createdAt, lt: new Date(before) };
+    if (after) where.createdAt = { ...where.createdAt, gt: new Date(after) };
+
+    const skip = (page - 1) * limit;
+    const messages = await prisma.message.findMany({
+      where,
+      include: {
+        sender: { select: { id: true, profile: true, role: true } },
+        recipient: true
+      },
+      orderBy: { createdAt: 'asc' },
+      skip,
+      take: limit
     });
 
-    // Mark messages as read for the current user
-    await Message.markConversationAsRead(conversationId, userId);
+    // Mark as read
+    await messageHelpers.markAsRead(conversationId, userId);
 
     res.json({
       success: true,
       messages,
       conversationId,
       pagination: {
-        currentPage: parseInt(page),
-        limit: parseInt(limit),
-        hasMore: messages.length === parseInt(limit)
+        currentPage: page,
+        limit,
+        hasMore: messages.length === limit
       }
     });
-
   } catch (error) {
     console.error('Get conversation error:', error);
-    res.status(500).json({ 
+    res.status(500).json({
       message: 'Failed to retrieve conversation',
       error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
@@ -138,48 +148,49 @@ router.get('/conversation/:conversationId', authMiddleware, async (req, res) => 
 router.get('/conversations', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.userId;
-    const { limit = 20 } = req.query;
+    const limit = parseInt(req.query.limit) || 20;
 
-    const conversations = await Message.getRecentConversations(userId, parseInt(limit));
+    // Fetch last message per conversation
+    const lastMessages = await prisma.message.findMany({
+      where: {
+        OR: [{ senderId: userId }, { recipientId: userId }],
+        isDeleted: false
+      },
+      distinct: ['conversationId'],
+      orderBy: { createdAt: 'desc' },
+      include: {
+        sender: { select: { id: true, profile: true, role: true, readerSettings: true } },
+        recipient: { select: { id: true, profile: true, role: true, readerSettings: true } }
+      },
+      take: limit
+    });
 
-    // Format conversations for response
-    const formattedConversations = conversations.map(conv => {
-      const lastMessage = conv.lastMessage;
-      const sender = conv.sender[0];
-      const receiver = conv.receiver[0];
-      
-      // Determine the other participant
-      const otherParticipant = lastMessage.senderId.toString() === userId 
-        ? receiver 
-        : sender;
-
+    const formatted = await Promise.all(lastMessages.map(async msg => {
+      const other = msg.senderId === userId ? msg.recipient : msg.sender;
+      const unreadCount = await messageHelpers.getUnreadCount(userId);
       return {
-        conversationId: conv._id,
+        conversationId: msg.conversationId,
         otherParticipant: {
-          id: otherParticipant._id,
-          name: otherParticipant.profile?.name || 'Anonymous',
-          avatar: otherParticipant.profile?.avatar,
-          role: otherParticipant.role,
-          isOnline: otherParticipant.role === 'reader' ? otherParticipant.readerSettings?.isOnline : false
+          id: other.id,
+          name: other.profile?.name || 'Anonymous',
+          avatar: other.profile?.avatar,
+          role: other.role,
+          isOnline: other.role === 'reader' ? other.readerSettings?.isOnline : false
         },
         lastMessage: {
-          content: lastMessage.content,
-          messageType: lastMessage.messageType,
-          createdAt: lastMessage.createdAt,
-          isFromMe: lastMessage.senderId.toString() === userId
+          content: msg.content,
+          messageType: msg.messageType,
+          createdAt: msg.createdAt,
+          isFromMe: msg.senderId === userId
         },
-        unreadCount: conv.unreadCount
+        unreadCount
       };
-    });
+    }));
 
-    res.json({
-      success: true,
-      conversations: formattedConversations
-    });
-
+    res.json({ success: true, conversations: formatted });
   } catch (error) {
     console.error('Get conversations error:', error);
-    res.status(500).json({ 
+    res.status(500).json({
       message: 'Failed to retrieve conversations',
       error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
@@ -190,47 +201,34 @@ router.get('/conversations', authMiddleware, async (req, res) => {
 router.get('/unread-count', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.userId;
-    const unreadCount = await Message.getUnreadCount(userId);
-
-    res.json({
-      success: true,
-      unreadCount
-    });
-
+    const unreadCount = await messageHelpers.getUnreadCount(userId);
+    res.json({ success: true, unreadCount });
   } catch (error) {
     console.error('Get unread count error:', error);
-    res.status(500).json({ 
+    res.status(500).json({
       message: 'Failed to get unread count',
       error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }
 });
 
-// Mark message as read
+// Mark single message as read
 router.patch('/:messageId/read', authMiddleware, async (req, res) => {
   try {
     const { messageId } = req.params;
     const userId = req.user.userId;
-
-    const message = await Message.findOne({
-      _id: messageId,
-      receiverId: userId
-    });
-
-    if (!message) {
+    const msg = await prisma.message.findUnique({ where: { id: messageId } });
+    if (!msg || msg.recipientId !== userId) {
       return res.status(404).json({ message: 'Message not found' });
     }
-
-    await message.markAsRead();
-
-    res.json({
-      success: true,
-      message: 'Message marked as read'
+    await prisma.message.update({
+      where: { id: messageId },
+      data: { isRead: true, readAt: new Date() }
     });
-
+    res.json({ success: true, message: 'Message marked as read' });
   } catch (error) {
     console.error('Mark as read error:', error);
-    res.status(500).json({ 
+    res.status(500).json({
       message: 'Failed to mark message as read',
       error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
@@ -242,24 +240,19 @@ router.patch('/conversation/:conversationId/read', authMiddleware, async (req, r
   try {
     const { conversationId } = req.params;
     const userId = req.user.userId;
-
-    // Verify user is part of this conversation
-    const [userId1, userId2] = conversationId.split('_');
-    if (userId !== userId1 && userId !== userId2) {
+    const [u1, u2] = conversationId.split('_');
+    if (userId !== u1 && userId !== u2) {
       return res.status(403).json({ message: 'Not authorized to modify this conversation' });
     }
-
-    const result = await Message.markConversationAsRead(conversationId, userId);
-
+    const result = await messageHelpers.markAsRead(conversationId, userId);
     res.json({
       success: true,
       message: 'Conversation marked as read',
-      modifiedCount: result.modifiedCount
+      modifiedCount: result.count
     });
-
   } catch (error) {
     console.error('Mark conversation as read error:', error);
-    res.status(500).json({ 
+    res.status(500).json({
       message: 'Failed to mark conversation as read',
       error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
@@ -273,95 +266,92 @@ router.patch('/:messageId/edit', authMiddleware, async (req, res) => {
     const { content } = req.body;
     const userId = req.user.userId;
 
-    if (!content || content.trim().length === 0) {
+    if (!content || !content.trim()) {
       return res.status(400).json({ message: 'Message content is required' });
     }
-
     if (content.length > 2000) {
       return res.status(400).json({ message: 'Message must be less than 2000 characters' });
     }
 
-    const message = await Message.findOne({
-      _id: messageId,
-      senderId: userId
-    });
-
-    if (!message) {
+    const msg = await prisma.message.findUnique({ where: { id: messageId } });
+    if (!msg || msg.senderId !== userId) {
       return res.status(404).json({ message: 'Message not found or not authorized' });
     }
 
-    // Check if message is too old to edit (e.g., 15 minutes)
-    const fifteenMinutesAgo = new Date(Date.now() - 15 * 60 * 1000);
-    if (message.createdAt < fifteenMinutesAgo) {
+    const fifteenAgo = new Date(Date.now() - 15 * 60 * 1000);
+    if (msg.createdAt < fifteenAgo) {
       return res.status(400).json({ message: 'Message is too old to edit' });
     }
 
-    await message.editContent(content.trim());
+    const updated = await prisma.message.update({
+      where: { id: messageId },
+      data: {
+        originalContent: msg.content,
+        content: content.trim(),
+        isEdited: true,
+        editedAt: new Date()
+      }
+    });
 
-    // Emit real-time update via socket.io
     const io = req.app.get('io');
     if (io) {
       io.emit('message-edited', {
-        messageId: message._id,
-        conversationId: message.conversationId,
-        newContent: message.content,
-        editedAt: message.editedAt
+        messageId: updated.id,
+        conversationId: updated.conversationId,
+        newContent: updated.content,
+        editedAt: updated.editedAt
       });
     }
 
     res.json({
       success: true,
       message: {
-        id: message._id,
-        content: message.content,
-        isEdited: message.isEdited,
-        editedAt: message.editedAt
+        id: updated.id,
+        content: updated.content,
+        isEdited: updated.isEdited,
+        editedAt: updated.editedAt
       }
     });
-
   } catch (error) {
     console.error('Edit message error:', error);
-    res.status(500).json({ 
+    res.status(500).json({
       message: 'Failed to edit message',
       error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }
 });
 
-// Delete message
+// Delete (soft) message
 router.delete('/:messageId', authMiddleware, async (req, res) => {
   try {
     const { messageId } = req.params;
     const userId = req.user.userId;
-
-    const message = await Message.findOne({
-      _id: messageId,
-      senderId: userId
-    });
-
-    if (!message) {
+    const msg = await prisma.message.findUnique({ where: { id: messageId } });
+    if (!msg || msg.senderId !== userId) {
       return res.status(404).json({ message: 'Message not found or not authorized' });
     }
 
-    await message.softDelete(userId);
+    await prisma.message.update({
+      where: { id: messageId },
+      data: {
+        isDeleted: true,
+        deletedAt: new Date(),
+        deletedBy: userId
+      }
+    });
 
-    // Emit real-time update via socket.io
     const io = req.app.get('io');
     if (io) {
       io.emit('message-deleted', {
-        messageId: message._id,
-        conversationId: message.conversationId
+        messageId,
+        conversationId: msg.conversationId
       });
     }
 
-    res.json({
-      success: true,
-      message: 'Message deleted successfully'
-    });
-
+    res.json({ success: true, message: 'Message deleted successfully' });
   } catch (error) {
     console.error('Delete message error:', error);
-    res.status(500).json({ 
+    res.status(500).json({
       message: 'Failed to delete message',
       error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
@@ -379,40 +369,41 @@ router.post('/:messageId/reaction', authMiddleware, async (req, res) => {
       return res.status(400).json({ message: 'Valid emoji is required' });
     }
 
-    const message = await Message.findById(messageId);
-    if (!message) {
+    const msg = await prisma.message.findUnique({ where: { id: messageId } });
+    if (!msg) {
       return res.status(404).json({ message: 'Message not found' });
     }
 
-    // Verify user is part of this conversation
-    const [userId1, userId2] = message.conversationId.split('_');
-    if (userId !== userId1 && userId !== userId2) {
+    const [u1, u2] = msg.conversationId.split('_');
+    if (userId !== u1 && userId !== u2) {
       return res.status(403).json({ message: 'Not authorized to react to this message' });
     }
 
-    await message.addReaction(userId, emoji);
+    const current = Array.isArray(msg.reactions) ? msg.reactions : [];
+    const filtered = current.filter(r => r.userId !== userId);
+    const reaction = { userId, emoji, createdAt: new Date().toISOString() };
+    const newReactions = [...filtered, reaction];
 
-    // Emit real-time update via socket.io
+    const updated = await prisma.message.update({
+      where: { id: messageId },
+      data: { reactions: newReactions }
+    });
+
     const io = req.app.get('io');
     if (io) {
       io.emit('message-reaction', {
-        messageId: message._id,
-        conversationId: message.conversationId,
+        messageId,
+        conversationId: msg.conversationId,
         userId,
         emoji,
-        reactions: message.reactions
+        reactions: updated.reactions
       });
     }
 
-    res.json({
-      success: true,
-      message: 'Reaction added',
-      reactions: message.reactions
-    });
-
+    res.json({ success: true, message: 'Reaction added', reactions: updated.reactions });
   } catch (error) {
     console.error('Add reaction error:', error);
-    res.status(500).json({ 
+    res.status(500).json({
       message: 'Failed to add reaction',
       error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
@@ -425,33 +416,33 @@ router.delete('/:messageId/reaction', authMiddleware, async (req, res) => {
     const { messageId } = req.params;
     const userId = req.user.userId;
 
-    const message = await Message.findById(messageId);
-    if (!message) {
+    const msg = await prisma.message.findUnique({ where: { id: messageId } });
+    if (!msg) {
       return res.status(404).json({ message: 'Message not found' });
     }
 
-    await message.removeReaction(userId);
+    const current = Array.isArray(msg.reactions) ? msg.reactions : [];
+    const newReactions = current.filter(r => r.userId !== userId);
 
-    // Emit real-time update via socket.io
+    const updated = await prisma.message.update({
+      where: { id: messageId },
+      data: { reactions: newReactions }
+    });
+
     const io = req.app.get('io');
     if (io) {
       io.emit('message-reaction-removed', {
-        messageId: message._id,
-        conversationId: message.conversationId,
+        messageId,
+        conversationId: msg.conversationId,
         userId,
-        reactions: message.reactions
+        reactions: updated.reactions
       });
     }
 
-    res.json({
-      success: true,
-      message: 'Reaction removed',
-      reactions: message.reactions
-    });
-
+    res.json({ success: true, message: 'Reaction removed', reactions: updated.reactions });
   } catch (error) {
     console.error('Remove reaction error:', error);
-    res.status(500).json({ 
+    res.status(500).json({
       message: 'Failed to remove reaction',
       error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });

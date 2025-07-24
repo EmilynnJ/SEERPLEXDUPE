@@ -1,8 +1,9 @@
 const express = require('express');
 const serverless = require('serverless-http');
-const mongoose = require('mongoose');
 const cors = require('cors');
 require('dotenv').config();
+
+const { prisma, healthCheck } = require('../../server/lib/prisma');
 
 // Import routes from server directory (more comprehensive implementations)
 const authRoutes = require('../../server/routes/auth');
@@ -18,13 +19,11 @@ const { authMiddleware } = require('../../server/middleware/auth');
 // Initialize Express
 const app = express();
 
-// Database connection
-mongoose.connect(process.env.MONGODB_URI, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-})
-.then(() => console.log('Connected to MongoDB'))
-.catch(err => console.error('MongoDB connection error:', err));
+// Initialize Prisma Client connection for serverless environment
+prisma
+  .$connect()
+  .then(() => console.log('Connected to database via Prisma'))
+  .catch(err => console.error('Prisma connection error:', err));
 
 // Middleware
 app.use(cors({
@@ -43,18 +42,20 @@ app.use('/messages', messageRoutes);
 app.use('/admin', adminRoutes);
 
 // Health check
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'OK', 
-    timestamp: new Date().toISOString(),
-    environment: process.env.NODE_ENV 
+app.get('/health', async (req, res) => {
+  const status = await healthCheck();
+  res.json({
+    status: status.status,
+    timestamp: status.timestamp,
+    environment: process.env.NODE_ENV,
+    ...(status.error ? { error: status.error } : {})
   });
 });
 
 // Error handling middleware
 app.use((err, req, res, next) => {
   console.error(err.stack);
-  res.status(500).json({ 
+  res.status(500).json({
     message: 'Something went wrong!',
     error: process.env.NODE_ENV === 'development' ? err.message : 'Internal server error'
   });

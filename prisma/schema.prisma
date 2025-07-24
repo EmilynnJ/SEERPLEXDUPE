@@ -1,0 +1,356 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique @db.VarChar(255)
+  password  String   @db.VarChar(255)
+  role      Role     @default(CLIENT)
+  
+  // Profile information
+  name              String?  @db.VarChar(255)
+  avatar            String?  @db.VarChar(500)
+  bio               String?  @db.VarChar(1000)
+  specialties       String[] @db.VarChar(100)
+  rating            Float    @default(0) @db.Real
+  totalReviews      Int      @default(0)
+  totalRating       Float    @default(0) @db.Real
+  
+  // Reader settings
+  isOnline          Boolean  @default(false)
+  videoRate         Float    @default(3.99) @db.Real
+  audioRate         Float    @default(2.99) @db.Real
+  chatRate          Float    @default(1.99) @db.Real
+  availability      Json?    @db.JsonB
+  autoAcceptSessions Boolean @default(false)
+  
+  // Financial information
+  balance           Float    @default(0) @db.Real
+  totalEarnings     Float    @default(0) @db.Real
+  pendingEarnings   Float    @default(0) @db.Real
+  paidEarnings      Float    @default(0) @db.Real
+  lastPayout        DateTime?
+  
+  // Stripe integration
+  stripeCustomerId  String?  @db.VarChar(255)
+  stripeAccountId   String?  @db.VarChar(255)
+  
+  // Status and verification
+  isVerified        Boolean  @default(false)
+  isActive          Boolean  @default(true)
+  lastSeen          DateTime @default(now())
+  
+  // Preferences
+  preferences       Json?    @db.JsonB
+  
+  // Timestamps
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  
+  // Relationships
+  clientSessions    Session[] @relation("ClientSessions")
+  readerSessions    Session[] @relation("ReaderSessions")
+  sentMessages      Message[] @relation("SentMessages")
+  receivedMessages  Message[] @relation("ReceivedMessages")
+  transactions      Transaction[]
+  clientBookings    Booking[] @relation("ClientBookings")
+  readerBookings    Booking[] @relation("ReaderBookings")
+  deletedMessages   Message[] @relation("DeletedMessages")
+  reactions         Reaction[]
+  
+  @@index([email])
+  @@index([role])
+  @@index([isOnline])
+  @@index([isActive])
+  @@index([rating])
+  @@index([lastSeen])
+  @@map("users")
+}
+
+model Session {
+  id              String        @id @default(cuid())
+  sessionId       String        @unique @db.VarChar(255)
+  clientId        String
+  readerId        String
+  sessionType     SessionType
+  status          SessionStatus @default(PENDING)
+  
+  // Timing
+  startTime       DateTime?
+  endTime         DateTime?
+  duration        Int           @default(0) // in seconds
+  
+  // Financial
+  rate            Float         @db.Real
+  totalCost       Float         @default(0) @db.Real
+  platformFee     Float         @default(0) @db.Real
+  readerEarnings  Float         @default(0) @db.Real
+  billingHistory  Json?         @db.JsonB
+  
+  // Review and feedback
+  rating          Int?          @db.SmallInt
+  review          String?       @db.VarChar(1000)
+  readerResponse  String?       @db.VarChar(500)
+  
+  // Notes
+  clientNotes     String?       @db.VarChar(1000)
+  readerNotes     String?       @db.VarChar(1000)
+  adminNotes      String?       @db.VarChar(1000)
+  
+  // Metadata
+  metadata        Json?         @db.JsonB
+  
+  // Flags
+  disputed        Boolean       @default(false)
+  refunded        Boolean       @default(false)
+  technicalIssues Boolean       @default(false)
+  
+  // Timestamps
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+  
+  // Relationships
+  client          User          @relation("ClientSessions", fields: [clientId], references: [id], onDelete: Cascade)
+  reader          User          @relation("ReaderSessions", fields: [readerId], references: [id], onDelete: Cascade)
+  messages        Message[]
+  transactions    Transaction[]
+  booking         Booking?
+  
+  @@index([sessionId])
+  @@index([clientId, createdAt])
+  @@index([readerId, createdAt])
+  @@index([status, createdAt])
+  @@index([sessionType])
+  @@index([rating])
+  @@map("sessions")
+}
+
+model Message {
+  id              String      @id @default(cuid())
+  senderId        String
+  receiverId      String
+  sessionId       String?
+  conversationId  String      @db.VarChar(255)
+  content         String      @db.VarChar(2000)
+  messageType     MessageType @default(TEXT)
+  
+  // Attachments
+  attachments     Json?       @db.JsonB
+  
+  // Status
+  isRead          Boolean     @default(false)
+  readAt          DateTime?
+  isEdited        Boolean     @default(false)
+  editedAt        DateTime?
+  originalContent String?     @db.VarChar(2000)
+  isDeleted       Boolean     @default(false)
+  deletedAt       DateTime?
+  deletedBy       String?
+  
+  // Reply functionality
+  replyToId       String?
+  
+  // Metadata
+  metadata        Json?       @db.JsonB
+  
+  // Timestamps
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+  
+  // Relationships
+  sender          User        @relation("SentMessages", fields: [senderId], references: [id], onDelete: Cascade)
+  receiver        User        @relation("ReceivedMessages", fields: [receiverId], references: [id], onDelete: Cascade)
+  session         Session?    @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+  replyTo         Message?    @relation("MessageReplies", fields: [replyToId], references: [id], onDelete: SetNull)
+  replies         Message[]   @relation("MessageReplies")
+  deleter         User?       @relation("DeletedMessages", fields: [deletedBy], references: [id], onDelete: SetNull)
+  reactions       Reaction[]
+  
+  @@index([senderId, receiverId, createdAt])
+  @@index([conversationId, createdAt])
+  @@index([sessionId, createdAt])
+  @@index([isRead, receiverId])
+  @@index([isDeleted])
+  @@map("messages")
+}
+
+model Reaction {
+  id        String   @id @default(cuid())
+  messageId String
+  userId    String
+  emoji     String   @db.VarChar(10)
+  createdAt DateTime @default(now())
+  
+  // Relationships
+  message   Message  @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  @@unique([messageId, userId])
+  @@index([messageId])
+  @@map("reactions")
+}
+
+model Transaction {
+  id                    String            @id @default(cuid())
+  userId                String
+  sessionId             String?
+  type                  TransactionType
+  amount                Float             @db.Real
+  currency              String            @default("USD") @db.VarChar(3)
+  
+  // Stripe integration
+  stripePaymentIntentId String?           @db.VarChar(255)
+  stripeTransferId      String?           @db.VarChar(255)
+  stripeChargeId        String?           @db.VarChar(255)
+  
+  // Status and processing
+  status                TransactionStatus @default(PENDING)
+  description           String            @db.VarChar(500)
+  processedAt           DateTime?
+  failureReason         String?           @db.VarChar(500)
+  retryCount            Int               @default(0)
+  
+  // Balance tracking
+  balanceBefore         Float?            @db.Real
+  balanceAfter          Float?            @db.Real
+  
+  // Fees
+  stripeFee             Float             @default(0) @db.Real
+  platformFee           Float             @default(0) @db.Real
+  totalFees             Float             @default(0) @db.Real
+  
+  // Metadata
+  metadata              Json?             @db.JsonB
+  
+  // Timestamps
+  createdAt             DateTime          @default(now())
+  updatedAt             DateTime          @updatedAt
+  
+  // Relationships
+  user                  User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  session               Session?          @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+  
+  @@index([userId, createdAt])
+  @@index([type, status])
+  @@index([stripePaymentIntentId])
+  @@index([stripeTransferId])
+  @@index([createdAt])
+  @@index([status])
+  @@map("transactions")
+}
+
+model Booking {
+  id              String        @id @default(cuid())
+  clientId        String
+  readerId        String
+  sessionId       String?       @unique
+  
+  // Booking details
+  scheduledTime   DateTime
+  duration        Int           // in minutes
+  sessionType     SessionType
+  timezone        String        @db.VarChar(50)
+  
+  // Status and management
+  status          BookingStatus @default(PENDING)
+  confirmationCode String?      @unique @db.VarChar(20)
+  
+  // Pricing
+  rate            Float         @db.Real
+  totalCost       Float         @db.Real
+  
+  // Notes and requirements
+  clientNotes     String?       @db.VarChar(1000)
+  readerNotes     String?       @db.VarChar(1000)
+  specialRequests String?       @db.VarChar(500)
+  
+  // Cancellation and rescheduling
+  cancelledAt     DateTime?
+  cancelledBy     String?
+  cancellationReason String?    @db.VarChar(500)
+  rescheduledFrom DateTime?
+  
+  // Reminders and notifications
+  remindersSent   Json?         @db.JsonB
+  
+  // Metadata
+  metadata        Json?         @db.JsonB
+  
+  // Timestamps
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+  
+  // Relationships
+  client          User          @relation("ClientBookings", fields: [clientId], references: [id], onDelete: Cascade)
+  reader          User          @relation("ReaderBookings", fields: [readerId], references: [id], onDelete: Cascade)
+  session         Session?      @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+  
+  @@index([clientId, scheduledTime])
+  @@index([readerId, scheduledTime])
+  @@index([status, scheduledTime])
+  @@index([scheduledTime])
+  @@index([confirmationCode])
+  @@map("bookings")
+}
+
+// Enums
+enum Role {
+  CLIENT
+  READER
+  ADMIN
+}
+
+enum SessionType {
+  VIDEO
+  AUDIO
+  CHAT
+}
+
+enum SessionStatus {
+  PENDING
+  ACTIVE
+  ENDED
+  CANCELLED
+}
+
+enum MessageType {
+  TEXT
+  IMAGE
+  FILE
+  SYSTEM
+  GIFT
+}
+
+enum TransactionType {
+  CHARGE
+  REFUND
+  PAYOUT
+  DEPOSIT
+  ADJUSTMENT
+}
+
+enum TransactionStatus {
+  PENDING
+  PROCESSING
+  SUCCEEDED
+  FAILED
+  CANCELLED
+  REFUNDED
+}
+
+enum BookingStatus {
+  PENDING
+  CONFIRMED
+  CANCELLED
+  COMPLETED
+  NO_SHOW
+}

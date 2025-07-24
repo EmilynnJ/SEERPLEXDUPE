@@ -1,0 +1,72 @@
+---
+description: Handles WebRTC session establishment, state management, and termination for psychic reading platform
+globs: server/utils/webrtcSignaling.js,server/routes/sessions.js,client/src/hooks/useWebRTC.js,server/index.js
+alwaysApply: false
+---
+
+
+# webrtc-session-flow
+
+## Session Lifecycle Management (Importance: 95)
+
+WebRTC session flow implements a specialized reading session state machine:
+
+1. Session Establishment
+- Reader availability verification pre-connection
+- Balance validation ensuring minimum session duration capability
+- Role-based connection authorization (reader vs client)
+- Rate calculation based on selected modality (video/audio/chat)
+
+2. Active Session Management
+- Continuous participant tracking with dual mapping system:
+  * activeSessions: sessionId → connected participants
+  * userSockets: userId → socketId for direct targeting
+- Real-time balance monitoring for automatic termination
+- Reader revenue split tracking (70/30)
+- Session state transitions: Pending → Active → Ended
+
+3. Session Termination Conditions
+- Insufficient client balance
+- Reader disconnection
+- Client disconnection
+- Policy violations
+- System maintenance
+- Technical errors
+
+## Participant Management (Importance: 85)
+
+1. Reader Controls
+- Online status tracking with timestamp updates
+- Session acceptance workflow
+- Rate management per modality
+- Auto-cleanup on disconnection
+
+2. Client Controls
+- Balance verification per minute
+- Session request initiation
+- Modality selection validation
+- Automatic termination notifications
+
+## Business Rules (Importance: 90)
+
+1. Session Validation
+- Readers must maintain verified online status
+- Clients restricted to single active/pending session
+- Readers restricted to single active session
+- Minimum balance requirement for initiation
+
+2. Financial Controls
+- Per-minute billing with real-time verification
+- Automatic termination on insufficient funds
+- Platform fee calculation (30%)
+- Reader earnings tracking (70%)
+
+3. State Management
+- Force cleanup of abandoned sessions
+- Participant tracking integrity
+- Reader-specific notification routing
+- Session membership validation
+
+$END$
+
+ If you're using this file in context, clearly say in italics in one small line that "Context added by Giga webrtc-session-flow" along with specifying exactly what information was used from this file in a human-friendly way, instead of using kebab-case use normal sentence case.

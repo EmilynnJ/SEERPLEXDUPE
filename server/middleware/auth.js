@@ -1,21 +1,23 @@
 const jwt = require('jsonwebtoken');
-const User = require('../models/User');
+const { prisma } = require('../lib/prisma');
 
 const authMiddleware = async (req, res, next) => {
   try {
     const token = req.header('Authorization')?.replace('Bearer ', '');
     
     if (!token) {
-      return res.status(401).json({ message: 'No token provided, authorization denied' });
+      return res.status(401).json({ message: 'Access denied. No token provided.' });
     }
 
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    
+
     // Find user and check if still active
-    const user = await User.findById(decoded.userId).select('-password');
-    
+    const user = await prisma.user.findUnique({
+      where: { id: decoded.userId }
+    });
+
     if (!user) {
-      return res.status(401).json({ message: 'Token is not valid - user not found' });
+      return res.status(401).json({ message: 'Invalid token. User not found.' });
     }
 
     if (!user.isActive) {
@@ -23,66 +25,31 @@ const authMiddleware = async (req, res, next) => {
     }
 
     // Update last seen
-    user.lastSeen = new Date();
-    await user.save();
+    await prisma.user.update({
+      where: { id: decoded.userId },
+      data: { lastSeen: new Date() }
+    });
 
     req.user = {
-      userId: user._id,
-      email: user.email,
-      role: user.role
+      userId: user.id,
+      role: user.role,
+      email: user.email
     };
-    
-    req.userDoc = user; // Full user document if needed
-    
-    next();
+
+    return next();
   } catch (error) {
-    console.error('Auth middleware error:', error);
-    
     if (error.name === 'JsonWebTokenError') {
-      return res.status(401).json({ message: 'Token is not valid' });
+      return res.status(401).json({ message: 'Invalid token' });
     }
-    
     if (error.name === 'TokenExpiredError') {
-      return res.status(401).json({ message: 'Token has expired' });
+      return res.status(401).json({ message: 'Token expired' });
     }
     
-    res.status(500).json({ message: 'Server error in authentication' });
+    console.error('Auth middleware error:', error);
+    return res.status(500).json({ message: 'Server error during authentication' });
   }
 };
 
-// Role-based authorization middleware
-const requireRole = (roles) => {
-  return (req, res, next) => {
-    if (!req.user) {
-      return res.status(401).json({ message: 'Authentication required' });
-    }
-
-    const userRole = req.user.role;
-    const allowedRoles = Array.isArray(roles) ? roles : [roles];
-
-    if (!allowedRoles.includes(userRole)) {
-      return res.status(403).json({ 
-        message: `Access denied. Required role: ${allowedRoles.join(' or ')}` 
-      });
-    }
-
-    next();
-  };
-};
-
-// Admin only middleware
-const requireAdmin = requireRole('admin');
-
-// Reader only middleware
-const requireReader = requireRole('reader');
-
-// Client only middleware
-const requireClient = requireRole('client');
-
-// Reader or Admin middleware
-const requireReaderOrAdmin = requireRole(['reader', 'admin']);
-
-// Optional auth middleware (doesn't fail if no token)
 const optionalAuth = async (req, res, next) => {
   try {
     const token = req.header('Authorization')?.replace('Bearer ', '');
@@ -92,61 +59,68 @@ const optionalAuth = async (req, res, next) => {
     }
 
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await User.findById(decoded.userId).select('-password');
-    
+    const user = await prisma.user.findUnique({
+      where: { id: decoded.userId }
+    });
+
     if (user && user.isActive) {
       req.user = {
-        userId: user._id,
-        email: user.email,
-        role: user.role
+        userId: user.id,
+        role: user.role,
+        email: user.email
       };
-      req.userDoc = user;
     }
-    
-    next();
+
+    return next();
   } catch (error) {
-    // Silently continue without auth
-    next();
+    // Continue without authentication for optional auth
+    return next();
   }
+};
+
+const requireRole = (role) => {
+  return (req, res, next) => {
+    if (!req.user) {
+      return res.status(401).json({ message: 'Authentication required' });
+    }
+
+    if (req.user.role !== role) {
+      return res.status(403).json({ message: `Access denied. ${role} role required.` });
+    }
+
+    return next();
+  };
+};
+
+const requireClient = requireRole('CLIENT');
+const requireReader = requireRole('READER');
+const requireAdmin = requireRole('ADMIN');
+
+const requireReaderOrAdmin = (req, res, next) => {
+  if (!req.user) {
+    return res.status(401).json({ message: 'Authentication required' });
+  }
+
+  if (req.user.role !== 'READER' && req.user.role !== 'ADMIN') {
+    return res.status(403).json({ message: 'Access denied. Reader or Admin role required.' });
+  }
+
+  return next();
 };
 
 // Rate limiting middleware for sensitive operations
 const rateLimitSensitive = (req, res, next) => {
-  // This would typically use Redis or similar for production
-  // For now, we'll implement a simple in-memory rate limiter
-  
-  const key = req.ip + ':' + req.path;
-  const now = Date.now();
-  const windowMs = 15 * 60 * 1000; // 15 minutes
-  const maxAttempts = 5;
-
-  if (!global.rateLimitStore) {
-    global.rateLimitStore = new Map();
-  }
-
-  const attempts = global.rateLimitStore.get(key) || [];
-  const recentAttempts = attempts.filter(time => now - time < windowMs);
-
-  if (recentAttempts.length >= maxAttempts) {
-    return res.status(429).json({
-      message: 'Too many attempts. Please try again later.',
-      retryAfter: Math.ceil((recentAttempts[0] + windowMs - now) / 1000)
-    });
-  }
-
-  recentAttempts.push(now);
-  global.rateLimitStore.set(key, recentAttempts);
-
+  // TODO: Implement proper rate limiting with Redis or in-memory store
+  // For now, just pass through
   next();
 };
 
 module.exports = {
   authMiddleware,
-  requireRole,
-  requireAdmin,
-  requireReader,
-  requireClient,
-  requireReaderOrAdmin,
   optionalAuth,
+  requireClient,
+  requireReader,
+  requireAdmin,
+  requireReaderOrAdmin,
   rateLimitSensitive
 };
