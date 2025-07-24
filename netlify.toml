@@ -5,8 +5,6 @@
 
 [build.environment]
   DATABASE_URL = "$DATABASE_URL"
-  SHADOW_DATABASE_URL = "$SHADOW_DATABASE_URL"
-  ABLY_API_KEY = "$ABLY_API_KEY"
 
 [functions]
   external_node_modules = ["@prisma/client"]
@@ -14,8 +12,6 @@
 
 [functions.environment]
   DATABASE_URL = "$DATABASE_URL"
-  SHADOW_DATABASE_URL = "$SHADOW_DATABASE_URL"
-  ABLY_API_KEY = "$ABLY_API_KEY"
 
 [dev]
   command = "npm run dev"
