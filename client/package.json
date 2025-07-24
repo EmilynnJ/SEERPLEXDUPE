@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@clerk/clerk-react": "^5.32.3",
+    "@stripe/react-stripe-js": "^3.8.0",
     "@stripe/stripe-js": "^2.4.0",
     "@vitejs/plugin-react": "^4.2.1",
     "autoprefixer": "^10.4.16",

@@ -1,47 +1,72 @@
 ---
-description: Implements real-time per-minute billing system for psychic reading sessions with revenue splitting and termination logic
-globs: server/utils/billing.js,server/routes/sessions.js,server/models/Transaction.js,server/models/Session.js
+description: Specification for implementing per-minute billing and revenue sharing for psychic reading sessions
+globs: server/utils/billing.js,server/routes/sessions.js,client/src/components/SessionTimer.jsx
 alwaysApply: false
 ---
 
 
 # session-billing-algorithm
 
-Key billing system components (Importance: 95):
+Core implementation of the per-minute billing system for psychic reading sessions.
 
-1. Per-Minute Rate Calculation
-- Base rates by session type:
-  - Video: $3.99/min
-  - Audio: $2.99/min 
-  - Chat: $1.99/min
-- Custom reader-specific rate multipliers
-- Real-time balance monitoring with automatic termination
-- Pre-session minimum balance verification
+## Billing Logic
 
-2. Revenue Distribution (Importance: 90)
-- 70% reader / 30% platform revenue split
-- Atomic transaction processing for payment splits
-- Pending earnings accumulation for readers
-- Daily automated payouts above $15 threshold
-- Stripe fee handling (2.9% + $0.30)
+1. Rate Structure
+- Video sessions: $3.99/minute 
+- Audio sessions: $2.99/minute
+- Chat sessions: $1.99/minute
 
-3. Session Control Logic (Importance: 85)
-- Continuous balance monitoring per billing cycle
-- Automatic termination on insufficient funds
-- Low balance warnings at 5-minute threshold
-- Grace period handling for connection issues
+2. Revenue Split
+- Reader earnings: 70% of session cost
+- Platform fee: 30% of session cost
 
-4. Transaction Management (Importance: 80)
-- Multi-stage billing state machine
-- Pre-authorization holds for minimum duration
-- Rollback mechanism for failed charges
-- Detailed transaction audit trail maintenance
+3. Session Monitoring
+- Balance checked every minute against session rate
+- Session automatically terminated if client balance insufficient
+- Minimum balance required: Cost of one minute at selected rate
+- Transaction recorded for each successful charge
 
-File Paths:
-- server/utils/billing.js: Core billing engine
-- server/routes/sessions.js: Session management integration
-- server/models/Transaction.js: Transaction state handling
-- server/models/Session.js: Session duration tracking
+4. Charge Processing Flow
+```
+1. Validate sufficient client balance
+2. Deduct rate from client balance
+3. Split amount between reader (70%) and platform (30%)
+4. Create transaction record
+5. If insufficient funds:
+   - End session
+   - Update session status
+   - Notify participants
+```
+
+## Session Duration Controls
+
+1. Real-Time Balance Check
+- Executed every 60 seconds
+- Verifies client has funds for next minute
+- Triggers session end if balance depleted
+
+2. Session Limits
+- Minimum duration: 1 minute
+- Maximum duration: 120 minutes
+- Early termination fee: None
+
+## Revenue Calculation
+
+1. Per-Session Revenue
+- Total cost = minutes × rate
+- Reader earnings = total cost × 0.70
+- Platform fee = total cost × 0.30
+
+2. Transaction Recording
+- Timestamp of charge
+- Amount charged
+- Split amounts
+- Session reference
+- Participants
+
+File paths:
+- server/utils/billing.js
+- server/routes/sessions.js
 
 $END$
 

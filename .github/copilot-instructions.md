@@ -10,66 +10,70 @@
 - Explain your OBSERVATIONS clearly, then provide REASONING to identify the exact issue. Add console logs when needed to gather more information.
 
 
-SoulSeer Psychic Reading Platform implements a specialized marketplace connecting psychic readers with clients through real-time video, audio and chat sessions.
+## Core Business Components
 
-Core Business Components:
+### Session Management & Billing System
+- Implements per-minute billing for psychic reading sessions
+- Manages session rates and durations (video: $3.99/min, audio: $2.99/min, chat: $1.99/min)
+- Handles automatic session termination on insufficient balance
+- Processes revenue sharing (70% reader, 30% platform)
+- Enforces minimum payout thresholds ($15.00)
+- Location: `server/utils/billing.js`
 
-1. Session Management (Importance: 95)
-- Pay-per-minute billing with 70/30 revenue split
-- Multi-mode communication (video/audio/chat) with tiered pricing
-- Real-time balance monitoring and automatic session termination
-- Custom WebRTC signaling optimized for psychic readings
-- Session recording and reader notes system
+### Reader Management
+- Implements verification workflow for psychic readers
+- Manages specialty validation and experience verification 
+- Handles availability scheduling with timezone support
+- Controls reader status based on performance metrics
+- Location: `server/routes/admin.js`
 
-2. Reader Professional System (Importance: 90)
-- Qualification and verification workflow
-- Customizable rates per service type (video: $3.99/min, audio: $2.99/min, chat: $1.99/min)
-- Availability scheduling with timezone support
-- Automatic daily payouts (minimum $15 threshold)
-- Performance metrics and ranking algorithm
+### Real-Time Communication
+- Manages WebRTC signaling for live sessions
+- Implements session routing between clients and readers
+- Handles connection quality monitoring
+- Manages concurrent session limits
+- Location: `server/utils/webrtcSignaling.js`
 
-3. Client Experience (Importance: 85)
-- Pre-paid balance system with real-time monitoring
-- Session history with reader notes
-- Favorite readers with notification system
-- Custom review criteria for psychic services
-- Low balance warnings and automatic termination
+### Payment Processing
+- Handles Stripe integration for deposits and payouts
+- Manages reader earnings and platform fees
+- Processes automatic daily payouts
+- Implements refund workflow for cancelled sessions
+- Location: `server/routes/stripe.js`
 
-4. Financial Operations (Importance: 80)
-- Dual-balance tracking (pending/available)
-- Multi-stage transaction verification
-- Revenue sharing calculations (70% reader / 30% platform)
-- Stripe integration for payment processing
-- Comprehensive transaction history
+### Notification System
+- Manages real-time session alerts and updates
+- Handles booking confirmations and reminders
+- Processes payment notifications
+- Supports email and SMS channels
+- Location: `server/utils/notifications.js`
 
-5. Quality Control (Importance: 75)
-- Reader verification requirements
-- Session quality monitoring
-- Dispute resolution system
-- Content moderation for profiles
-- Automated performance scoring
+### Data Migration System
+- Transforms user, session, message, and transaction data
+- Ensures referential integrity during migrations
+- Provides rollback mechanisms
+- Validates migration completeness
+- Location: `scripts/migrate-data.js`
 
-Key Integration Points:
+## Critical Business Rules
 
-1. Session Workflow (`server/routes/sessions.js`)
-- Validates reader availability
-- Enforces single active session policy
-- Implements per-minute billing
-- Handles session termination rules
+### Session Policies
+- Minimum session duration requirements
+- Cancellation and refund policies
+- Reader availability requirements
+- Maximum session duration limits
 
-2. Financial Processing (`server/routes/stripe.js`)
-- Manages dual-balance system
-- Calculates and distributes revenue shares
-- Processes reader payouts
-- Maintains transaction records
+### Reader Requirements
+- Minimum rating thresholds
+- Required response times
+- Specialty verification requirements
+- Commission structure based on experience
 
-3. Reader Management (`server/routes/users.js`)
-- Controls reader discovery system
-- Tracks earnings and metrics
-- Manages availability status
-- Handles verification workflow
-
-The platform emphasizes real-time interaction management, fair revenue sharing, and quality control while maintaining the unique aspects of psychic reading services.
+### Platform Governance
+- Reader performance monitoring
+- Client feedback validation
+- Dispute resolution procedures
+- Quality control mechanisms
 
 $END$
 

@@ -1,87 +1,60 @@
 ---
-description: Documents core data models, schemas, relationships and business rules for the psychic reading platform
-globs: server/models/*,server/routes/*,server/utils/billing.js
+description: Technical specification for core data models and their relationships in a psychic reading platform
+globs: server/models/*,server/migrations/*,server/schema.prisma
 alwaysApply: false
 ---
 
 
 # data-models
 
-## Core Models
+## Core Data Models
 
-### User Model (server/models/User.js)
-- Role-based structure (client/reader/admin) with distinct business rules per role
-- Reader profile includes:
-  - Service rates by type (video: $3.99, audio: $2.99, chat: $1.99)
-  - Availability schedule with timezone support
-  - Earnings tracking (total/pending/paid)
-  - Specialties and verification status
-  - Rating aggregation with weighted calculations
-Importance: 95
+### User Model
+- Role-based differentiation (client, reader, admin) with specific fields per role
+- Reader-specific fields:
+  - Specialty categories (tarot, astrology, etc.)
+  - Rate tiers for different session types (video, audio, chat)
+  - Verification status and reader stats
+- Client-specific fields: 
+  - Balance for pay-per-minute sessions
+  - Session history and favorites
 
-### Session Model (server/models/Session.js)  
-- Multi-type session support (video/audio/chat)
-- Revenue sharing (70% reader / 30% platform)
-- Real-time billing and duration tracking
-- Quality monitoring with connection status
-- Dispute/refund flagging system
-Importance: 90
+### Session Model
+- Pay-per-minute billing tracking with start/end timestamps
+- Different rates per session type (video/audio/chat)
+- Status transitions (pending, active, ended, cancelled)
+- Revenue sharing calculations (70% reader, 30% platform)
+- Links to transactions and messages within session
 
-### Transaction Model (server/models/Transaction.js)
-- Multi-type transaction handling (charge/refund/payout/deposit)
-- Balance tracking with before/after states
-- Fee calculation (platform + payment processing)
-- Revenue reporting with daily aggregation
-- Reader payout thresholds ($15 minimum)
-Importance: 85
+### Message Model
+- Conversation tracking between clients and readers
+- Message types (session, regular, system)
+- Read status and delivery timestamps 
+- Reactions and editing history
 
-### Message Model (server/models/Message.js)
-- Conversation tracking with unique participant IDs
-- Message versioning and soft deletion
-- Read receipt system with timestamps  
-- Paid message handling and priority levels
-- Reaction system with user limits
-Importance: 75
+### Transaction Model
+- Session billing records with per-minute charges
+- Platform fee calculations and revenue splits
+- Reader payout tracking and thresholds
+- Client balance updates and refunds
 
-## Key Relationships
+### Domain-Specific Constraints
+- Minimum session duration requirements
+- Maximum session length limits
+- Minimum reader payout threshold ($15.00)
+- Reader rating thresholds for active status
+- Cancellation and refund policies
 
-1. User-Session:
-- Readers can only have one active session
-- Clients must maintain sufficient balance
-- Session rates tied to reader profiles
-Importance: 90
+### Relationships
+- Sessions link clients and readers
+- Messages belong to sessions or direct conversations
+- Transactions reference sessions and users
+- User reviews linked to completed sessions
 
-2. Session-Transaction:
-- Automatic per-minute billing
-- Revenue splitting calculations
-- Balance verification workflow
-Importance: 85
-
-3. User-Message:
-- Conversation access limited to participants
-- Message editing time restrictions (15 min)
-- Reader-specific messaging rules
-Importance: 70
-
-## Business Constraints
-
-1. Financial Rules:
-- Minimum payout threshold: $15
-- Platform fee: 30% of session revenue
-- Required reader verification for payments
-Importance: 95
-
-2. Session Rules:
-- Single active session per user
-- Real-time balance monitoring
-- Automatic termination on insufficient funds
-Importance: 90
-
-3. Reader Rules:
-- Verification required before accepting sessions
-- Rate limits within platform guidelines
-- Online status tracking requirements
-Importance: 85
+File paths:
+- server/schema.prisma 
+- server/models/*
+- server/migrations/*
 
 $END$
 

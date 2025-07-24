@@ -1,58 +1,52 @@
 ---
-description: Documents core WebRTC session management, including establishment, participant tracking, and state transitions
-globs: **/webrtcSignaling.js,**/Session.js,**/sessions.js,**/index.js
+description: Technical specification for WebRTC session lifecycle management, signaling, and state transitions
+globs: server/utils/webrtcSignaling.js,server/routes/sessions.js,client/src/hooks/useWebRTC.js
 alwaysApply: false
 ---
 
 
 # webrtc-session-flow
 
-## Session Lifecycle Management (Importance: 95)
-- Dual tracking system maps active sessions and participant connections:
-  - `activeSessions`: Maintains session state and participant lists
-  - `userSockets`: Links user IDs to WebSocket connections
-- State transitions enforced through validation gates:
-  - Pre-session: Reader availability and client balance verification
-  - Active: Continuous participant presence monitoring
-  - Termination: Automatic cleanup on participant departure
+## Session Lifecycle Management
 
-## Participant Management (Importance: 90)
-- Business role enforcement (reader/client) with distinct permissions
-- Reader-specific session controls:
-  - Online status tracking integrated with session availability
-  - Auto-accept configuration for incoming requests
-  - Rate configuration by session type (video/audio/chat)
-- Client validation:
-  - Real-time balance verification
-  - Single active session policy
-  - Automatic termination on insufficient funds
+### Session Establishment
+- Client initiates session request to reader
+- Validates client balance for minimum session duration
+- Checks reader availability and active session conflicts
+- Creates pending session record with unique ID
+- Notifies reader of incoming session request
+- Reader accepts/declines request within timeout window
+- Upon acceptance, establishes WebRTC peer connection
+- Notifies client of acceptance and begins billing cycle
 
-## Session Types & Billing (Importance: 85)
-- Multi-mode communication support:
-  - Video: $3.99/min
-  - Audio: $2.99/min
-  - Chat: $1.99/min
-- Real-time billing system:
-  - Per-minute charges
-  - 70/30 revenue split (reader/platform)
-  - Balance monitoring with low-balance warnings
-  - Automatic termination triggers
+### State Management 
+- Tracks session states: PENDING, ACTIVE, ENDED
+- Updates user availability during active sessions
+- Maintains per-minute billing cycle during ACTIVE state
+- Enforces session timeouts:
+  - 60 seconds for reader to accept/decline
+  - 30 seconds for client to join after acceptance
+  - Automatic end on insufficient balance
 
-## Signaling Implementation (Importance: 80)
-- Custom session coordination for psychic readings:
-  - Offer/answer exchange with reading-specific metadata
-  - ICE candidate distribution with role-based permissions
-  - Session state broadcasting to participants
-- Reader notification system:
-  - Targeted delivery based on readerId
-  - Availability status integration
-  - Session request state tracking
+### Participant Tracking
+- Associates sockets with user IDs for signaling
+- Validates participant authorization for session actions
+- Updates participant connection quality metrics
+- Tracks media state changes (audio/video mute)
+- Records participant join/leave timestamps
+- Manages reconnection attempts for dropped connections
 
-Relevant Files:
-- server/utils/webrtcSignaling.js
-- server/routes/sessions.js
-- server/models/Session.js
-- server/index.js
+### Termination Conditions
+- Normal end: Either participant ends session
+- Automatic end: Insufficient client balance
+- Timeout: Participant fails to join
+- Error: Connection/media failures
+- Force end: Administrative action
+
+## File Paths
+- `server/utils/webrtcSignaling.js`: Core signaling and session state management
+- `server/routes/sessions.js`: Session lifecycle endpoints and billing integration 
+- `client/src/hooks/useWebRTC.js`: Client-side WebRTC connection management
 
 $END$
 

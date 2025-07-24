@@ -1,54 +1,64 @@
 ---
-description: Specification for financial processing, payment handling, and revenue management in a psychic reading platform
-globs: server/routes/stripe.js,server/utils/billing.js,server/models/Transaction.js,server/routes/sessions.js
+description: Financial processing specification for psychic reading platform including payment processing, billing, and revenue sharing
+globs: server/utils/billing.js,server/routes/stripe.js,server/routes/sessions.js
 alwaysApply: false
 ---
 
 
 # financial-processing
 
-## Core Payment Processing (Importance: 95)
-- Revenue sharing model: 70% to readers, 30% platform fee
-- Per-minute billing system with real-time balance monitoring
-- Transaction states: pending → succeeded/failed with rollback mechanism
-- Automatic fee calculation including Stripe fees (2.9% + $0.30)
-- Minimum payout threshold of $15 for reader earnings
+## Core Payment Processing Components
 
-## Session Billing (Importance: 90)
-- Pre-session balance verification against reader's rate
-- Real-time charging system with continuous balance monitoring 
-- Tiered pricing structure:
+### Session Billing System
+- Per-minute billing rates:
   - Video: $3.99/min
   - Audio: $2.99/min 
   - Chat: $1.99/min
-- Auto-termination on insufficient client balance
+- Real-time balance checking and automatic session termination
+- Platform fee: 30%
+- Reader earnings: 70% 
 
-## Reader Earnings Management (Importance: 85)
-- Dual balance tracking: pending and available funds
-- Daily automated payouts at 2 AM for eligible readers
-- Period-based earnings calculations (7d/30d/90d/1y)
-- Earnings categories: pending, paid, total
-- Requires valid Stripe Connect account for payouts
+### Payout Management
+- Minimum payout threshold: $15.00
+- Automated daily payouts to qualified readers
+- Manual payout requests for readers
+- Stripe Connect integration for reader payouts
+- Payout transaction logging and status tracking
 
-## Transaction Tracking (Importance: 80)
-- Comprehensive transaction history with balance snapshots
-- Fee breakdowns and adjustments logging
-- Links between payment intents and transfers
-- Multi-stage transaction verification process
-- Earnings reconciliation for failed transfers
+### Balance Management
+- Client prepaid balance system
+- Real-time deduction during active sessions
+- Insufficient funds handling
+- Balance top-up via Stripe
+- Transaction history tracking
 
-## Balance Management (Importance: 75)
-- Client pre-paid balance system
-- Real-time available funds monitoring
-- Automatic fee deductions and splits
-- Balance threshold alerts and enforcement
-- Transaction rollback on payment failures
+### Revenue Sharing Model
+- Standard split:
+  - Platform: 30%
+  - Reader: 70%
+- Fee calculation and distribution
+- Earnings tracking per reader
+- Platform revenue tracking
 
-Relevant Files:
-- server/routes/stripe.js
-- server/utils/billing.js
-- server/models/Transaction.js
-- server/routes/sessions.js
+### Financial Validation Rules
+- Minimum session charge: 1 minute at applicable rate
+- Required client balance before session start
+- Payout eligibility requirements:
+  - Minimum $15.00 balance
+  - Verified Stripe Connect account
+  - No pending disputes
+
+### Transaction Types
+- Session charges
+- Balance deposits
+- Reader payouts
+- Refunds
+- Platform fees
+
+File Paths:
+- server/utils/billing.js - Core billing logic
+- server/routes/stripe.js - Payment processing
+- server/routes/sessions.js - Session billing
 
 $END$
 
