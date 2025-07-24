@@ -1,279 +1,208 @@
-const validator = require('validator');
+const { body, validationResult } = require('express-validator');
 
-// Email validation
-const validateEmail = (email) => {
-  if (!email || typeof email !== 'string') {
-    return { isValid: false, message: 'Email is required' };
+// Handle validation errors
+const handleValidationErrors = (req, res, next) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({
+      message: 'Validation failed',
+      errors: errors.array()
+    });
   }
-  
-  if (!validator.isEmail(email)) {
-    return { isValid: false, message: 'Please provide a valid email address' };
-  }
-  
-  return { isValid: true };
-};
-
-// Password validation
-const validatePassword = (password) => {
-  if (!password || typeof password !== 'string') {
-    return { isValid: false, message: 'Password is required' };
-  }
-  
-  if (password.length < 6) {
-    return { isValid: false, message: 'Password must be at least 6 characters long' };
-  }
-  
-  if (password.length > 128) {
-    return { isValid: false, message: 'Password must be less than 128 characters' };
-  }
-  
-  // Check for at least one letter and one number
-  if (!/(?=.*[a-zA-Z])(?=.*\d)/.test(password)) {
-    return { isValid: false, message: 'Password must contain at least one letter and one number' };
-  }
-  
-  return { isValid: true };
+  next();
 };
 
 // User registration validation
-const validateUserRegistration = (req, res, next) => {
-  const { email, password, role } = req.body;
+const validateUserRegistration = [
+  body('email')
+    .isEmail()
+    .normalizeEmail()
+    .withMessage('Please provide a valid email address'),
   
-  // Validate email
-  const emailValidation = validateEmail(email);
-  if (!emailValidation.isValid) {
-    return res.status(400).json({ message: emailValidation.message });
-  }
+  body('password')
+    .isLength({ min: 8 })
+    .withMessage('Password must be at least 8 characters long')
+    .matches(/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)/)
+    .withMessage('Password must contain at least one uppercase letter, one lowercase letter, and one number'),
   
-  // Validate password
-  const passwordValidation = validatePassword(password);
-  if (!passwordValidation.isValid) {
-    return res.status(400).json({ message: passwordValidation.message });
-  }
+  body('name')
+    .optional()
+    .isLength({ min: 2, max: 50 })
+    .withMessage('Name must be between 2 and 50 characters')
+    .trim(),
   
-  // Validate role
-  const validRoles = ['client', 'reader', 'admin'];
-  if (role && !validRoles.includes(role)) {
-    return res.status(400).json({ message: 'Invalid role specified' });
-  }
-  
-  // Prevent direct reader registration (admin only)
-  if (role === 'reader' && (!req.user || req.user.role !== 'admin')) {
-    return res.status(403).json({ message: 'Reader accounts can only be created by administrators' });
-  }
-  
-  next();
-};
+  handleValidationErrors
+];
 
 // User login validation
-const validateUserLogin = (req, res, next) => {
-  const { email, password } = req.body;
+const validateUserLogin = [
+  body('email')
+    .isEmail()
+    .normalizeEmail()
+    .withMessage('Please provide a valid email address'),
   
-  // Validate email
-  const emailValidation = validateEmail(email);
-  if (!emailValidation.isValid) {
-    return res.status(400).json({ message: emailValidation.message });
-  }
+  body('password')
+    .notEmpty()
+    .withMessage('Password is required'),
   
-  // Check password exists
-  if (!password || typeof password !== 'string') {
-    return res.status(400).json({ message: 'Password is required' });
-  }
-  
-  next();
-};
+  handleValidationErrors
+];
 
 // Profile update validation
-const validateProfileUpdate = (req, res, next) => {
-  const { name, bio, specialties } = req.body;
+const validateProfileUpdate = [
+  body('name')
+    .optional()
+    .isLength({ min: 2, max: 50 })
+    .withMessage('Name must be between 2 and 50 characters')
+    .trim(),
   
-  // Validate name
-  if (name !== undefined) {
-    if (typeof name !== 'string') {
-      return res.status(400).json({ message: 'Name must be a string' });
-    }
-    
-    if (name.length > 100) {
-      return res.status(400).json({ message: 'Name must be less than 100 characters' });
-    }
-    
-    // Sanitize name
-    req.body.name = validator.escape(name.trim());
-  }
+  body('bio')
+    .optional()
+    .isLength({ max: 1000 })
+    .withMessage('Bio must be less than 1000 characters')
+    .trim(),
   
-  // Validate bio
-  if (bio !== undefined) {
-    if (typeof bio !== 'string') {
-      return res.status(400).json({ message: 'Bio must be a string' });
-    }
-    
-    if (bio.length > 1000) {
-      return res.status(400).json({ message: 'Bio must be less than 1000 characters' });
-    }
-    
-    // Sanitize bio
-    req.body.bio = validator.escape(bio.trim());
-  }
+  body('specialties')
+    .optional()
+    .isArray()
+    .withMessage('Specialties must be an array'),
   
-  // Validate specialties
-  if (specialties !== undefined) {
-    if (!Array.isArray(specialties)) {
-      return res.status(400).json({ message: 'Specialties must be an array' });
-    }
-    
-    if (specialties.length > 10) {
-      return res.status(400).json({ message: 'Maximum 10 specialties allowed' });
-    }
-    
-    // Validate and sanitize each specialty
-    req.body.specialties = specialties.map(specialty => {
-      if (typeof specialty !== 'string') {
-        throw new Error('Each specialty must be a string');
-      }
-      
-      if (specialty.length > 50) {
-        throw new Error('Each specialty must be less than 50 characters');
-      }
-      
-      return validator.escape(specialty.trim());
-    }).filter(specialty => specialty.length > 0);
-  }
+  body('specialties.*')
+    .optional()
+    .isLength({ min: 2, max: 50 })
+    .withMessage('Each specialty must be between 2 and 50 characters')
+    .trim(),
   
-  next();
-};
+  body('avatar')
+    .optional()
+    .isURL()
+    .withMessage('Avatar must be a valid URL'),
+  
+  handleValidationErrors
+];
 
 // Reader rates validation
-const validateReaderRates = (req, res, next) => {
-  const { rates } = req.body;
+const validateReaderRates = [
+  body('rates.video')
+    .optional()
+    .isFloat({ min: 0.50, max: 50.00 })
+    .withMessage('Video rate must be between $0.50 and $50.00'),
   
-  if (!rates || typeof rates !== 'object') {
-    return res.status(400).json({ message: 'Rates object is required' });
-  }
+  body('rates.audio')
+    .optional()
+    .isFloat({ min: 0.50, max: 50.00 })
+    .withMessage('Audio rate must be between $0.50 and $50.00'),
   
-  const { video, audio, chat } = rates;
+  body('rates.chat')
+    .optional()
+    .isFloat({ min: 0.50, max: 50.00 })
+    .withMessage('Chat rate must be between $0.50 and $50.00'),
   
-  // Validate each rate
-  const rateTypes = { video, audio, chat };
-  
-  for (const [type, rate] of Object.entries(rateTypes)) {
-    if (rate !== undefined) {
-      if (typeof rate !== 'number' || isNaN(rate)) {
-        return res.status(400).json({ message: `${type} rate must be a valid number` });
-      }
-      
-      if (rate < 0.50) {
-        return res.status(400).json({ message: `${type} rate must be at least $0.50` });
-      }
-      
-      if (rate > 50.00) {
-        return res.status(400).json({ message: `${type} rate must be less than $50.00` });
-      }
-      
-      // Round to 2 decimal places
-      req.body.rates[type] = Math.round(rate * 100) / 100;
-    }
-  }
-  
-  next();
-};
+  handleValidationErrors
+];
 
 // Session request validation
-const validateSessionRequest = (req, res, next) => {
-  const { readerId, sessionType } = req.body;
+const validateSessionRequest = [
+  body('readerId')
+    .notEmpty()
+    .withMessage('Reader ID is required')
+    .isLength({ min: 20, max: 30 })
+    .withMessage('Invalid reader ID format'),
   
-  // Validate readerId
-  if (!readerId || typeof readerId !== 'string') {
-    return res.status(400).json({ message: 'Reader ID is required' });
-  }
+  body('sessionType')
+    .isIn(['VIDEO', 'AUDIO', 'CHAT'])
+    .withMessage('Session type must be VIDEO, AUDIO, or CHAT'),
   
-  if (!validator.isMongoId(readerId)) {
-    return res.status(400).json({ message: 'Invalid reader ID format' });
-  }
-  
-  // Validate sessionType
-  const validSessionTypes = ['video', 'audio', 'chat'];
-  if (!sessionType || !validSessionTypes.includes(sessionType)) {
-    return res.status(400).json({ message: 'Valid session type is required (video, audio, or chat)' });
-  }
-  
-  next();
-};
-
-// Message validation
-const validateMessage = (req, res, next) => {
-  const { content, messageType } = req.body;
-  
-  // Validate content
-  if (!content || typeof content !== 'string') {
-    return res.status(400).json({ message: 'Message content is required' });
-  }
-  
-  if (content.length > 2000) {
-    return res.status(400).json({ message: 'Message must be less than 2000 characters' });
-  }
-  
-  // Sanitize content
-  req.body.content = validator.escape(content.trim());
-  
-  // Validate messageType
-  const validMessageTypes = ['text', 'image', 'file', 'system', 'gift'];
-  if (messageType && !validMessageTypes.includes(messageType)) {
-    return res.status(400).json({ message: 'Invalid message type' });
-  }
-  
-  next();
-};
+  handleValidationErrors
+];
 
 // Payment amount validation
-const validatePaymentAmount = (req, res, next) => {
-  const { amount } = req.body;
+const validatePaymentAmount = [
+  body('amount')
+    .isInt({ min: 500, max: 50000 }) // $5.00 to $500.00 in cents
+    .withMessage('Amount must be between $5.00 and $500.00'),
   
-  if (!amount || typeof amount !== 'number' || isNaN(amount)) {
-    return res.status(400).json({ message: 'Valid amount is required' });
-  }
-  
-  if (amount < 100) { // $1.00 minimum in cents
-    return res.status(400).json({ message: 'Minimum amount is $1.00' });
-  }
-  
-  if (amount > 50000) { // $500.00 maximum in cents
-    return res.status(400).json({ message: 'Maximum amount is $500.00' });
-  }
-  
-  // Ensure amount is an integer (cents)
-  req.body.amount = Math.round(amount);
-  
-  next();
-};
+  handleValidationErrors
+];
 
-// Sanitize input middleware
-const sanitizeInput = (req, res, next) => {
-  const sanitizeObject = (obj) => {
-    for (const key in obj) {
-      if (typeof obj[key] === 'string') {
-        obj[key] = validator.escape(obj[key].trim());
-      } else if (typeof obj[key] === 'object' && obj[key] !== null) {
-        sanitizeObject(obj[key]);
+// Message validation
+const validateMessage = [
+  body('content')
+    .notEmpty()
+    .withMessage('Message content is required')
+    .isLength({ min: 1, max: 2000 })
+    .withMessage('Message must be between 1 and 2000 characters')
+    .trim(),
+  
+  body('receiverId')
+    .notEmpty()
+    .withMessage('Receiver ID is required'),
+  
+  body('messageType')
+    .optional()
+    .isIn(['TEXT', 'IMAGE', 'FILE', 'SYSTEM'])
+    .withMessage('Invalid message type'),
+  
+  handleValidationErrors
+];
+
+// Booking validation
+const validateBooking = [
+  body('readerId')
+    .notEmpty()
+    .withMessage('Reader ID is required'),
+  
+  body('scheduledTime')
+    .isISO8601()
+    .withMessage('Scheduled time must be a valid date')
+    .custom((value) => {
+      const scheduledDate = new Date(value);
+      const now = new Date();
+      if (scheduledDate <= now) {
+        throw new Error('Scheduled time must be in the future');
       }
-    }
-  };
+      return true;
+    }),
   
-  if (req.body && typeof req.body === 'object') {
-    sanitizeObject(req.body);
-  }
+  body('duration')
+    .isInt({ min: 15, max: 180 })
+    .withMessage('Duration must be between 15 and 180 minutes'),
   
-  next();
-};
+  body('sessionType')
+    .isIn(['VIDEO', 'AUDIO', 'CHAT'])
+    .withMessage('Session type must be VIDEO, AUDIO, or CHAT'),
+  
+  body('timezone')
+    .notEmpty()
+    .withMessage('Timezone is required'),
+  
+  handleValidationErrors
+];
+
+// Review validation
+const validateReview = [
+  body('rating')
+    .isInt({ min: 1, max: 5 })
+    .withMessage('Rating must be between 1 and 5'),
+  
+  body('review')
+    .optional()
+    .isLength({ max: 1000 })
+    .withMessage('Review must be less than 1000 characters')
+    .trim(),
+  
+  handleValidationErrors
+];
 
 module.exports = {
-  validateEmail,
-  validatePassword,
   validateUserRegistration,
   validateUserLogin,
   validateProfileUpdate,
   validateReaderRates,
   validateSessionRequest,
-  validateMessage,
   validatePaymentAmount,
-  sanitizeInput
+  validateMessage,
+  validateBooking,
+  validateReview,
+  handleValidationErrors
 };

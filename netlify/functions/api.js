@@ -5,16 +5,14 @@ require('dotenv').config();
 
 const { prisma, healthCheck } = require('../../server/lib/prisma');
 
-// Import routes from server directory (more comprehensive implementations)
+// Import routes from server directory
 const authRoutes = require('../../server/routes/auth');
 const userRoutes = require('../../server/routes/users');
 const sessionRoutes = require('../../server/routes/sessions');
 const stripeRoutes = require('../../server/routes/stripe');
 const messageRoutes = require('../../server/routes/messages');
 const adminRoutes = require('../../server/routes/admin');
-
-// Import middleware from server directory
-const { authMiddleware } = require('../../server/middleware/auth');
+const bookingRoutes = require('../../server/routes/bookings');
 
 // Initialize Express
 const app = express();
@@ -30,8 +28,8 @@ app.use(cors({
   origin: process.env.CLIENT_URL || "*",
   credentials: true
 }));
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Routes - using path relative to /.netlify/functions/api
 app.use('/auth', authRoutes);
@@ -40,6 +38,7 @@ app.use('/sessions', sessionRoutes);
 app.use('/stripe', stripeRoutes);
 app.use('/messages', messageRoutes);
 app.use('/admin', adminRoutes);
+app.use('/bookings', bookingRoutes);
 
 // Health check
 app.get('/health', async (req, res) => {

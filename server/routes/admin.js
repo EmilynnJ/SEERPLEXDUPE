@@ -1,10 +1,8 @@
 const express = require('express');
-const User = require('../models/User');
-const Session = require('../models/Session');
-const Transaction = require('../models/Transaction');
-const Message = require('../models/Message');
+const { prisma, handlePrismaError } = require('../lib/prisma');
 const { authMiddleware, requireAdmin } = require('../middleware/auth');
 const { validateUserRegistration, validateProfileUpdate } = require('../middleware/validation');
+const bcrypt = require('bcryptjs');
 
 const router = express.Router();
 
@@ -23,55 +21,62 @@ router.get('/readers', async (req, res) => {
     } = req.query;
 
     // Build query
-    const query = { role: 'reader' };
+    const where = { role: 'READER' };
     
     if (status === 'active') {
-      query.isActive = true;
+      where.isActive = true;
     } else if (status === 'inactive') {
-      query.isActive = false;
+      where.isActive = false;
     } else if (status === 'online') {
-      query['readerSettings.isOnline'] = true;
-      query.isActive = true;
+      where.isOnline = true;
+      where.isActive = true;
     }
 
     // Build sort
-    const sort = {};
-    sort[sortBy] = sortOrder === 'desc' ? -1 : 1;
+    const orderBy = {};
+    orderBy[sortBy] = sortOrder === 'desc' ? 'desc' : 'asc';
 
-    const readers = await User.find(query)
-      .select('-password')
-      .sort(sort)
-      .limit(limit * 1)
-      .skip((page - 1) * limit)
-      .lean();
+    const skip = (page - 1) * limit;
 
-    const total = await User.countDocuments(query);
-
-    // Get additional stats for each reader
-    const readersWithStats = await Promise.all(readers.map(async (reader) => {
-      const sessionStats = await Session.aggregate([
-        { $match: { readerId: reader._id } },
-        {
-          $group: {
-            _id: null,
-            totalSessions: { $sum: 1 },
-            totalEarnings: { $sum: '$readerEarnings' },
-            averageRating: { $avg: '$rating' }
+    const [readers, total] = await Promise.all([
+      prisma.user.findMany({
+        where,
+        orderBy,
+        take: parseInt(limit),
+        skip,
+        include: {
+          readerSessions: {
+            where: { status: 'ENDED' },
+            select: {
+              totalCost: true,
+              readerEarnings: true,
+              rating: true
+            }
           }
         }
-      ]);
+      }),
+      prisma.user.count({ where })
+    ]);
 
-      const stats = sessionStats[0] || {
-        totalSessions: 0,
-        totalEarnings: 0,
-        averageRating: 0
-      };
+    // Calculate stats for each reader
+    const readersWithStats = readers.map(reader => {
+      const sessions = reader.readerSessions;
+      const totalSessions = sessions.length;
+      const totalEarnings = sessions.reduce((sum, s) => sum + (s.readerEarnings || 0), 0);
+      const averageRating = sessions.length > 0 
+        ? sessions.reduce((sum, s) => sum + (s.rating || 0), 0) / sessions.length 
+        : 0;
 
       return {
         ...reader,
-        stats
+        readerSessions: undefined, // Remove from response
+        stats: {
+          totalSessions,
+          totalEarnings,
+          averageRating: Math.round(averageRating * 100) / 100
+        }
       };
-    }));
+    });
 
     res.json({
       success: true,
@@ -103,48 +108,48 @@ router.post('/readers', validateUserRegistration, async (req, res) => {
       name, 
       bio, 
       specialties = [], 
-      rates = { video: 3.99, audio: 2.99, chat: 1.99 }
+      videoRate = 3.99,
+      audioRate = 2.99,
+      chatRate = 1.99
     } = req.body;
 
     // Check if user already exists
-    const existingUser = await User.findOne({ email });
+    const existingUser = await prisma.user.findUnique({
+      where: { email }
+    });
+
     if (existingUser) {
       return res.status(400).json({ message: 'User with this email already exists' });
     }
 
+    // Hash password
+    const hashedPassword = await bcrypt.hash(password, 12);
+
     // Create reader account
-    const reader = new User({
-      email,
-      password,
-      role: 'reader',
-      profile: {
+    const reader = await prisma.user.create({
+      data: {
+        email,
+        password: hashedPassword,
+        role: 'READER',
         name: name || '',
         bio: bio || '',
-        specialties: Array.isArray(specialties) ? specialties : []
-      },
-      readerSettings: {
-        rates: {
-          video: rates.video || 3.99,
-          audio: rates.audio || 2.99,
-          chat: rates.chat || 1.99
-        },
+        specialties: Array.isArray(specialties) ? specialties : [],
+        videoRate: parseFloat(videoRate),
+        audioRate: parseFloat(audioRate),
+        chatRate: parseFloat(chatRate),
+        isVerified: true, // Admin-created accounts are pre-verified
+        isActive: true,
         isOnline: false
-      },
-      isVerified: true // Admin-created accounts are pre-verified
+      }
     });
 
-    await reader.save();
+    // Remove password from response
+    const { password: _, ...readerResponse } = reader;
 
     res.status(201).json({
       success: true,
       message: 'Reader account created successfully',
-      reader: {
-        id: reader._id,
-        email: reader.email,
-        profile: reader.profile,
-        readerSettings: reader.readerSettings,
-        createdAt: reader.createdAt
-      }
+      reader: readerResponse
     });
 
   } catch (error) {
@@ -162,219 +167,67 @@ router.patch('/readers/:readerId', async (req, res) => {
     const { readerId } = req.params;
     const updates = req.body;
 
-    const reader = await User.findOne({ _id: readerId, role: 'reader' });
+    const reader = await prisma.user.findUnique({
+      where: { id: readerId, role: 'READER' }
+    });
+
     if (!reader) {
       return res.status(404).json({ message: 'Reader not found' });
     }
 
     // Build update object
-    const updateObj = {};
+    const updateData = {};
     
     if (updates.isActive !== undefined) {
-      updateObj.isActive = updates.isActive;
+      updateData.isActive = updates.isActive;
     }
     
     if (updates.isVerified !== undefined) {
-      updateObj.isVerified = updates.isVerified;
+      updateData.isVerified = updates.isVerified;
     }
     
-    if (updates.profile) {
-      if (updates.profile.name !== undefined) {
-        updateObj['profile.name'] = updates.profile.name;
-      }
-      if (updates.profile.bio !== undefined) {
-        updateObj['profile.bio'] = updates.profile.bio;
-      }
-      if (updates.profile.specialties !== undefined) {
-        updateObj['profile.specialties'] = updates.profile.specialties;
-      }
+    if (updates.name !== undefined) {
+      updateData.name = updates.name;
     }
     
-    if (updates.readerSettings) {
-      if (updates.readerSettings.rates) {
-        updateObj['readerSettings.rates'] = updates.readerSettings.rates;
-      }
-      if (updates.readerSettings.isOnline !== undefined) {
-        updateObj['readerSettings.isOnline'] = updates.readerSettings.isOnline;
-      }
+    if (updates.bio !== undefined) {
+      updateData.bio = updates.bio;
+    }
+    
+    if (updates.specialties !== undefined) {
+      updateData.specialties = updates.specialties;
+    }
+    
+    if (updates.videoRate !== undefined) {
+      updateData.videoRate = parseFloat(updates.videoRate);
+    }
+    
+    if (updates.audioRate !== undefined) {
+      updateData.audioRate = parseFloat(updates.audioRate);
+    }
+    
+    if (updates.chatRate !== undefined) {
+      updateData.chatRate = parseFloat(updates.chatRate);
     }
 
-    const updatedReader = await User.findByIdAndUpdate(
-      readerId,
-      { $set: updateObj },
-      { new: true, runValidators: true }
-    ).select('-password');
+    const updatedReader = await prisma.user.update({
+      where: { id: readerId },
+      data: updateData
+    });
+
+    // Remove password from response
+    const { password: _, ...readerResponse } = updatedReader;
 
     res.json({
       success: true,
       message: 'Reader updated successfully',
-      reader: updatedReader
+      reader: readerResponse
     });
 
   } catch (error) {
     console.error('Admin update reader error:', error);
     res.status(500).json({ 
       message: 'Failed to update reader',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
-    });
-  }
-});
-
-// Delete reader account
-router.delete('/readers/:readerId', async (req, res) => {
-  try {
-    const { readerId } = req.params;
-
-    const reader = await User.findOne({ _id: readerId, role: 'reader' });
-    if (!reader) {
-      return res.status(404).json({ message: 'Reader not found' });
-    }
-
-    // Check for active sessions
-    const activeSessions = await Session.countDocuments({
-      readerId,
-      status: { $in: ['pending', 'active'] }
-    });
-
-    if (activeSessions > 0) {
-      return res.status(400).json({ 
-        message: 'Cannot delete reader with active sessions',
-        activeSessions
-      });
-    }
-
-    // Soft delete by deactivating
-    reader.isActive = false;
-    reader.readerSettings.isOnline = false;
-    await reader.save();
-
-    res.json({
-      success: true,
-      message: 'Reader account deactivated successfully'
-    });
-
-  } catch (error) {
-    console.error('Admin delete reader error:', error);
-    res.status(500).json({ 
-      message: 'Failed to delete reader',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
-    });
-  }
-});
-
-// Get all sessions
-router.get('/sessions', async (req, res) => {
-  try {
-    const { 
-      page = 1, 
-      limit = 20, 
-      status,
-      sessionType,
-      startDate,
-      endDate,
-      readerId,
-      clientId
-    } = req.query;
-
-    // Build query
-    const query = {};
-    
-    if (status) query.status = status;
-    if (sessionType) query.sessionType = sessionType;
-    if (readerId) query.readerId = readerId;
-    if (clientId) query.clientId = clientId;
-    
-    if (startDate || endDate) {
-      query.createdAt = {};
-      if (startDate) query.createdAt.$gte = new Date(startDate);
-      if (endDate) query.createdAt.$lte = new Date(endDate);
-    }
-
-    const sessions = await Session.find(query)
-      .populate('clientId', 'email profile.name')
-      .populate('readerId', 'email profile.name')
-      .sort({ createdAt: -1 })
-      .limit(limit * 1)
-      .skip((page - 1) * limit)
-      .lean();
-
-    const total = await Session.countDocuments(query);
-
-    res.json({
-      success: true,
-      sessions,
-      pagination: {
-        currentPage: parseInt(page),
-        totalPages: Math.ceil(total / limit),
-        totalSessions: total,
-        hasNext: page * limit < total,
-        hasPrev: page > 1
-      }
-    });
-
-  } catch (error) {
-    console.error('Admin get sessions error:', error);
-    res.status(500).json({ 
-      message: 'Failed to retrieve sessions',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
-    });
-  }
-});
-
-// Get all users (clients and readers)
-router.get('/users', async (req, res) => {
-  try {
-    const { 
-      page = 1, 
-      limit = 20, 
-      role,
-      status = 'all',
-      search
-    } = req.query;
-
-    // Build query
-    const query = {};
-    
-    if (role) query.role = role;
-    
-    if (status === 'active') {
-      query.isActive = true;
-    } else if (status === 'inactive') {
-      query.isActive = false;
-    }
-    
-    if (search) {
-      query.$or = [
-        { email: { $regex: search, $options: 'i' } },
-        { 'profile.name': { $regex: search, $options: 'i' } }
-      ];
-    }
-
-    const users = await User.find(query)
-      .select('-password')
-      .sort({ createdAt: -1 })
-      .limit(limit * 1)
-      .skip((page - 1) * limit)
-      .lean();
-
-    const total = await User.countDocuments(query);
-
-    res.json({
-      success: true,
-      users,
-      pagination: {
-        currentPage: parseInt(page),
-        totalPages: Math.ceil(total / limit),
-        totalUsers: total,
-        hasNext: page * limit < total,
-        hasPrev: page > 1
-      }
-    });
-
-  } catch (error) {
-    console.error('Admin get users error:', error);
-    res.status(500).json({ 
-      message: 'Failed to retrieve users',
       error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }
@@ -405,62 +258,73 @@ router.get('/stats', async (req, res) => {
     }
 
     // Get user statistics
-    const userStats = await User.aggregate([
-      {
-        $group: {
-          _id: '$role',
-          count: { $sum: 1 },
-          active: {
-            $sum: { $cond: [{ $eq: ['$isActive', true] }, 1, 0] }
-          }
-        }
-      }
+    const [totalUsers, totalClients, totalReaders, activeReaders] = await Promise.all([
+      prisma.user.count(),
+      prisma.user.count({ where: { role: 'CLIENT' } }),
+      prisma.user.count({ where: { role: 'READER' } }),
+      prisma.user.count({ where: { role: 'READER', isOnline: true } })
     ]);
 
     // Get session statistics
-    const sessionStats = await Session.getStatistics({
-      createdAt: { $gte: startDate }
-    });
+    const [totalSessions, periodSessions, sessionStats] = await Promise.all([
+      prisma.session.count(),
+      prisma.session.count({
+        where: { createdAt: { gte: startDate } }
+      }),
+      prisma.session.aggregate({
+        where: {
+          status: 'ENDED',
+          createdAt: { gte: startDate }
+        },
+        _sum: {
+          totalCost: true,
+          platformFee: true,
+          readerEarnings: true,
+          duration: true
+        },
+        _avg: {
+          totalCost: true,
+          duration: true,
+          rating: true
+        }
+      })
+    ]);
 
     // Get transaction statistics
-    const transactionStats = await Transaction.getStatistics({
-      createdAt: { $gte: startDate },
-      status: 'succeeded'
-    });
-
-    // Get recent activity
-    const recentSessions = await Session.find({
-      createdAt: { $gte: startDate }
-    })
-    .populate('clientId', 'email')
-    .populate('readerId', 'email profile.name')
-    .sort({ createdAt: -1 })
-    .limit(10)
-    .lean();
-
-    // Format user stats
-    const formattedUserStats = {
-      clients: 0,
-      readers: 0,
-      admins: 0,
-      activeClients: 0,
-      activeReaders: 0,
-      activeAdmins: 0
-    };
-
-    userStats.forEach(stat => {
-      formattedUserStats[stat._id + 's'] = stat.count;
-      formattedUserStats['active' + stat._id.charAt(0).toUpperCase() + stat._id.slice(1) + 's'] = stat.active;
+    const transactionStats = await prisma.transaction.aggregate({
+      where: {
+        status: 'SUCCEEDED',
+        createdAt: { gte: startDate }
+      },
+      _sum: { amount: true },
+      _count: { id: true }
     });
 
     res.json({
       success: true,
       period,
       stats: {
-        users: formattedUserStats,
-        sessions: sessionStats,
-        transactions: transactionStats,
-        recentActivity: recentSessions
+        users: {
+          total: totalUsers,
+          clients: totalClients,
+          readers: totalReaders,
+          activeReaders
+        },
+        sessions: {
+          total: totalSessions,
+          period: periodSessions,
+          totalRevenue: sessionStats._sum.totalCost || 0,
+          platformRevenue: sessionStats._sum.platformFee || 0,
+          readerEarnings: sessionStats._sum.readerEarnings || 0,
+          totalMinutes: Math.floor((sessionStats._sum.duration || 0) / 60),
+          averageSessionCost: sessionStats._avg.totalCost || 0,
+          averageSessionDuration: Math.floor((sessionStats._avg.duration || 0) / 60),
+          averageRating: sessionStats._avg.rating || 0
+        },
+        transactions: {
+          total: transactionStats._count.id || 0,
+          volume: transactionStats._sum.amount || 0
+        }
       }
     });
 
@@ -468,172 +332,6 @@ router.get('/stats', async (req, res) => {
     console.error('Admin get stats error:', error);
     res.status(500).json({ 
       message: 'Failed to retrieve statistics',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
-    });
-  }
-});
-
-// Get revenue analytics
-router.get('/revenue', async (req, res) => {
-  try {
-    const { period = '30d' } = req.query;
-
-    let days = 30;
-    switch (period) {
-      case '7d': days = 7; break;
-      case '30d': days = 30; break;
-      case '90d': days = 90; break;
-      case '1y': days = 365; break;
-    }
-
-    const dailyRevenue = await Transaction.getDailyRevenue(days);
-
-    // Calculate totals
-    const totalRevenue = dailyRevenue.reduce((sum, day) => sum + day.revenue, 0);
-    const totalTransactions = dailyRevenue.reduce((sum, day) => sum + day.transactions, 0);
-    const averageDaily = totalRevenue / days;
-
-    // Get platform fee (30% of total revenue)
-    const platformRevenue = totalRevenue * 0.30;
-    const readerPayouts = totalRevenue * 0.70;
-
-    res.json({
-      success: true,
-      period,
-      revenue: {
-        total: totalRevenue,
-        platform: platformRevenue,
-        readerPayouts,
-        averageDaily,
-        totalTransactions,
-        dailyBreakdown: dailyRevenue
-      }
-    });
-
-  } catch (error) {
-    console.error('Admin get revenue error:', error);
-    res.status(500).json({ 
-      message: 'Failed to retrieve revenue data',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
-    });
-  }
-});
-
-// Manually process reader payouts
-router.post('/payouts/process', async (req, res) => {
-  try {
-    const minimumPayout = 15.00;
-
-    // Find readers with pending earnings >= minimum
-    const eligibleReaders = await User.find({
-      role: 'reader',
-      'earnings.pending': { $gte: minimumPayout },
-      stripeAccountId: { $exists: true, $ne: null }
-    });
-
-    const results = [];
-
-    for (const reader of eligibleReaders) {
-      try {
-        // Process payout logic would go here
-        // For now, just simulate the payout
-        
-        const payoutAmount = reader.earnings.pending;
-        
-        // Update reader earnings
-        reader.earnings.pending = 0;
-        reader.earnings.paid += payoutAmount;
-        reader.earnings.lastPayout = new Date();
-        await reader.save();
-
-        // Create transaction record
-        const transaction = new Transaction({
-          userId: reader._id,
-          type: 'payout',
-          amount: payoutAmount,
-          status: 'succeeded',
-          description: `Automatic payout - $${payoutAmount.toFixed(2)}`,
-          metadata: {
-            automaticPayout: true
-          }
-        });
-        await transaction.save();
-
-        results.push({
-          readerId: reader._id,
-          email: reader.email,
-          amount: payoutAmount,
-          status: 'success'
-        });
-
-      } catch (error) {
-        results.push({
-          readerId: reader._id,
-          email: reader.email,
-          amount: reader.earnings.pending,
-          status: 'failed',
-          error: error.message
-        });
-      }
-    }
-
-    res.json({
-      success: true,
-      message: `Processed ${results.filter(r => r.status === 'success').length} payouts`,
-      results
-    });
-
-  } catch (error) {
-    console.error('Admin process payouts error:', error);
-    res.status(500).json({ 
-      message: 'Failed to process payouts',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
-    });
-  }
-});
-
-// Update user account (admin override)
-router.patch('/users/:userId', async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const updates = req.body;
-
-    const user = await User.findById(userId);
-    if (!user) {
-      return res.status(404).json({ message: 'User not found' });
-    }
-
-    // Build update object
-    const updateObj = {};
-    
-    if (updates.isActive !== undefined) {
-      updateObj.isActive = updates.isActive;
-    }
-    
-    if (updates.isVerified !== undefined) {
-      updateObj.isVerified = updates.isVerified;
-    }
-    
-    if (updates.balance !== undefined && user.role === 'client') {
-      updateObj.balance = updates.balance;
-    }
-
-    const updatedUser = await User.findByIdAndUpdate(
-      userId,
-      { $set: updateObj },
-      { new: true, runValidators: true }
-    ).select('-password');
-
-    res.json({
-      success: true,
-      message: 'User updated successfully',
-      user: updatedUser
-    });
-
-  } catch (error) {
-    console.error('Admin update user error:', error);
-    res.status(500).json({ 
-      message: 'Failed to update user',
       error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }

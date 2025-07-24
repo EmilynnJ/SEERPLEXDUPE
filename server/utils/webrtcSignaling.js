@@ -1,5 +1,4 @@
-const Session = require('../models/Session');
-const User = require('../models/User');
+const { prisma } = require('../lib/prisma');
 
 class WebRTCSignaling {
   constructor(io) {
@@ -14,10 +13,42 @@ class WebRTCSignaling {
       console.log(`WebRTC: User connected - ${socket.id}`);
 
       // Register user with their socket
-      socket.on('register-user', (userId) => {
-        this.userSockets.set(userId, socket.id);
-        socket.userId = userId;
-        console.log(`WebRTC: User ${userId} registered with socket ${socket.id}`);
+      socket.on('register-user', async (data) => {
+        try {
+          const { userId, token } = data;
+          
+          // Verify user exists and is active
+          const user = await prisma.user.findUnique({
+            where: { id: userId, isActive: true }
+          });
+
+          if (!user) {
+            socket.emit('error', { message: 'Invalid user or user not active' });
+            return;
+          }
+
+          this.userSockets.set(userId, socket.id);
+          socket.userId = userId;
+          socket.userRole = user.role;
+          
+          // Update user's last seen
+          await prisma.user.update({
+            where: { id: userId },
+            data: { lastSeen: new Date() }
+          });
+
+          console.log(`WebRTC: User ${userId} (${user.role}) registered with socket ${socket.id}`);
+          
+          socket.emit('registered', { 
+            userId, 
+            role: user.role,
+            isOnline: user.isOnline 
+          });
+
+        } catch (error) {
+          console.error('WebRTC register user error:', error);
+          socket.emit('error', { message: 'Failed to register user' });
+        }
       });
 
       // Join a session room
@@ -26,16 +57,20 @@ class WebRTCSignaling {
           const { sessionId, userId } = data;
           
           // Verify session exists and user is authorized
-          const session = await Session.findOne({ sessionId })
-            .populate('clientId readerId');
+          const session = await prisma.session.findFirst({
+            where: { sessionId },
+            include: {
+              client: true,
+              reader: true
+            }
+          });
           
           if (!session) {
             socket.emit('error', { message: 'Session not found' });
             return;
           }
 
-          const isAuthorized = session.clientId._id.toString() === userId || 
-                              session.readerId._id.toString() === userId;
+          const isAuthorized = session.client.id === userId || session.reader.id === userId;
           
           if (!isAuthorized) {
             socket.emit('error', { message: 'Not authorized for this session' });
@@ -50,7 +85,8 @@ class WebRTCSignaling {
           if (!this.activeSessions.has(sessionId)) {
             this.activeSessions.set(sessionId, {
               participants: new Set(),
-              session: session
+              session: session,
+              startTime: new Date()
             });
           }
           
@@ -60,7 +96,29 @@ class WebRTCSignaling {
           socket.to(sessionId).emit('user-joined', {
             userId,
             socketId: socket.id,
-            userRole: session.clientId._id.toString() === userId ? 'client' : 'reader'
+            userRole: session.client.id === userId ? 'client' : 'reader',
+            userName: session.client.id === userId ? session.client.name : session.reader.name,
+            userAvatar: session.client.id === userId ? session.client.avatar : session.reader.avatar
+          });
+
+          // Send session info to joining user
+          socket.emit('session-joined', {
+            sessionId,
+            sessionType: session.sessionType,
+            status: session.status,
+            rate: session.rate,
+            startTime: session.startTime,
+            participants: this.activeSessions.get(sessionId).participants.size,
+            client: {
+              id: session.client.id,
+              name: session.client.name,
+              avatar: session.client.avatar
+            },
+            reader: {
+              id: session.reader.id,
+              name: session.reader.name,
+              avatar: session.reader.avatar
+            }
           });
 
           console.log(`WebRTC: User ${userId} joined session ${sessionId}`);
@@ -80,7 +138,9 @@ class WebRTCSignaling {
           return;
         }
 
-        // Forward offer to target user
+        console.log(`WebRTC: Forwarding offer from ${socket.userId} to ${targetUserId || 'all'}`);
+
+        // Forward offer to target user or broadcast
         if (targetUserId) {
           const targetSocketId = this.userSockets.get(targetUserId);
           if (targetSocketId) {
@@ -91,7 +151,6 @@ class WebRTCSignaling {
             });
           }
         } else {
-          // Broadcast to all other participants in session
           socket.to(sessionId).emit('webrtc-offer', {
             sessionId,
             offer,
@@ -109,7 +168,9 @@ class WebRTCSignaling {
           return;
         }
 
-        // Forward answer to target user
+        console.log(`WebRTC: Forwarding answer from ${socket.userId} to ${targetUserId || 'all'}`);
+
+        // Forward answer to target user or broadcast
         if (targetUserId) {
           const targetSocketId = this.userSockets.get(targetUserId);
           if (targetSocketId) {
@@ -159,7 +220,7 @@ class WebRTCSignaling {
       // Handle session chat messages
       socket.on('session-message', async (data) => {
         try {
-          const { sessionId, message, messageType = 'text' } = data;
+          const { sessionId, message, messageType = 'TEXT' } = data;
           
           if (!socket.sessionId || socket.sessionId !== sessionId) {
             socket.emit('error', { message: 'Not in session' });
@@ -172,13 +233,37 @@ class WebRTCSignaling {
             return;
           }
 
-          // Broadcast message to all participants
+          // Get session info to determine receiver
+          const session = sessionData.session;
+          const receiverId = session.client.id === socket.userId ? session.reader.id : session.client.id;
+
+          // Save message to database
+          const savedMessage = await prisma.message.create({
+            data: {
+              senderId: socket.userId,
+              receiverId,
+              sessionId: session.id,
+              conversationId: `session_${sessionId}`,
+              content: message,
+              messageType
+            },
+            include: {
+              sender: {
+                select: { id: true, name: true, avatar: true, role: true }
+              }
+            }
+          });
+
+          // Broadcast message to all participants in session
           const messageData = {
+            id: savedMessage.id,
             sessionId,
             message,
             messageType,
             fromUserId: socket.userId,
-            timestamp: new Date().toISOString()
+            fromUserName: savedMessage.sender.name,
+            fromUserAvatar: savedMessage.sender.avatar,
+            timestamp: savedMessage.createdAt
           };
 
           this.io.to(sessionId).emit('session-message', messageData);
@@ -201,14 +286,32 @@ class WebRTCSignaling {
         socket.to(sessionId).emit('peer-connection-quality', {
           fromUserId: socket.userId,
           quality,
-          stats
+          stats,
+          timestamp: new Date().toISOString()
+        });
+      });
+
+      // Handle media state changes (mute/unmute, video on/off)
+      socket.on('media-state-change', (data) => {
+        const { sessionId, mediaType, enabled } = data;
+        
+        if (!socket.sessionId || socket.sessionId !== sessionId) {
+          return;
+        }
+
+        // Broadcast media state change to other participants
+        socket.to(sessionId).emit('peer-media-state-change', {
+          fromUserId: socket.userId,
+          mediaType, // 'audio' or 'video'
+          enabled,
+          timestamp: new Date().toISOString()
         });
       });
 
       // Handle session end
       socket.on('end-session', async (data) => {
         try {
-          const { sessionId } = data;
+          const { sessionId, reason = 'user_ended' } = data;
           
           if (!socket.sessionId || socket.sessionId !== sessionId) {
             socket.emit('error', { message: 'Not in session' });
@@ -219,7 +322,8 @@ class WebRTCSignaling {
           socket.to(sessionId).emit('session-ended', {
             sessionId,
             endedBy: socket.userId,
-            reason: 'user_ended'
+            reason,
+            timestamp: new Date().toISOString()
           });
 
           // Clean up session
@@ -230,18 +334,77 @@ class WebRTCSignaling {
         }
       });
 
+      // Handle reader status updates
+      socket.on('update-reader-status', async (data) => {
+        try {
+          if (socket.userRole !== 'READER') {
+            socket.emit('error', { message: 'Only readers can update status' });
+            return;
+          }
+
+          const { isOnline } = data;
+          
+          await prisma.user.update({
+            where: { id: socket.userId },
+            data: { 
+              isOnline: Boolean(isOnline),
+              lastSeen: new Date()
+            }
+          });
+
+          // Broadcast status update
+          socket.broadcast.emit('reader-status-update', {
+            readerId: socket.userId,
+            isOnline: Boolean(isOnline),
+            timestamp: new Date().toISOString()
+          });
+
+          socket.emit('status-updated', { isOnline: Boolean(isOnline) });
+
+        } catch (error) {
+          console.error('WebRTC update reader status error:', error);
+          socket.emit('error', { message: 'Failed to update status' });
+        }
+      });
+
       // Handle disconnection
       socket.on('disconnect', async () => {
         console.log(`WebRTC: User disconnected - ${socket.id}`);
         
-        // Clean up user socket mapping
-        if (socket.userId) {
-          this.userSockets.delete(socket.userId);
-        }
-        
-        // Clean up session if user was in one
-        if (socket.sessionId) {
-          await this.cleanupSession(socket.sessionId, socket);
+        try {
+          // Update user's last seen and set offline if reader
+          if (socket.userId) {
+            const updateData = { lastSeen: new Date() };
+            
+            if (socket.userRole === 'READER') {
+              updateData.isOnline = false;
+            }
+
+            await prisma.user.update({
+              where: { id: socket.userId },
+              data: updateData
+            });
+
+            // Clean up user socket mapping
+            this.userSockets.delete(socket.userId);
+
+            // Broadcast reader offline status
+            if (socket.userRole === 'READER') {
+              socket.broadcast.emit('reader-status-update', {
+                readerId: socket.userId,
+                isOnline: false,
+                timestamp: new Date().toISOString()
+              });
+            }
+          }
+          
+          // Clean up session if user was in one
+          if (socket.sessionId) {
+            await this.cleanupSession(socket.sessionId, socket);
+          }
+
+        } catch (error) {
+          console.error('WebRTC disconnect cleanup error:', error);
         }
       });
     });
@@ -262,7 +425,8 @@ class WebRTCSignaling {
           // Notify remaining participants
           socket.to(sessionId).emit('participant-left', {
             userId: socket.userId,
-            remainingParticipants: sessionData.participants.size
+            remainingParticipants: sessionData.participants.size,
+            timestamp: new Date().toISOString()
           });
         }
       }
@@ -280,11 +444,15 @@ class WebRTCSignaling {
     const readerSocketId = this.userSockets.get(readerId);
     
     if (readerSocketId) {
-      this.io.to(readerSocketId).emit('new-session-request', sessionRequest);
+      this.io.to(readerSocketId).emit('new-session-request', {
+        ...sessionRequest,
+        timestamp: new Date().toISOString()
+      });
       console.log(`WebRTC: Notified reader ${readerId} of new session request`);
       return true;
     }
     
+    console.log(`WebRTC: Reader ${readerId} not connected for session request notification`);
     return false;
   }
 
@@ -293,11 +461,15 @@ class WebRTCSignaling {
     const clientSocketId = this.userSockets.get(clientId);
     
     if (clientSocketId) {
-      this.io.to(clientSocketId).emit('session-accepted', sessionData);
+      this.io.to(clientSocketId).emit('session-accepted', {
+        ...sessionData,
+        timestamp: new Date().toISOString()
+      });
       console.log(`WebRTC: Notified client ${clientId} of session acceptance`);
       return true;
     }
     
+    console.log(`WebRTC: Client ${clientId} not connected for session acceptance notification`);
     return false;
   }
 
@@ -309,7 +481,8 @@ class WebRTCSignaling {
       this.io.to(sessionId).emit('session-force-ended', {
         sessionId,
         reason,
-        message: this.getEndReasonMessage(reason)
+        message: this.getEndReasonMessage(reason),
+        timestamp: new Date().toISOString()
       });
       
       // Clean up
@@ -324,7 +497,8 @@ class WebRTCSignaling {
       'reader_offline': 'Session ended because reader went offline',
       'system_maintenance': 'Session ended for system maintenance',
       'violation': 'Session ended due to policy violation',
-      'technical_error': 'Session ended due to technical error'
+      'technical_error': 'Session ended due to technical error',
+      'timeout': 'Session ended due to inactivity timeout'
     };
     
     return messages[reason] || 'Session ended';
@@ -344,6 +518,23 @@ class WebRTCSignaling {
   getSessionParticipants(sessionId) {
     const sessionData = this.activeSessions.get(sessionId);
     return sessionData ? Array.from(sessionData.participants) : [];
+  }
+
+  // Get online readers
+  getOnlineReaders() {
+    const onlineReaders = [];
+    for (const [userId, socketId] of this.userSockets.entries()) {
+      const socket = this.io.sockets.sockets.get(socketId);
+      if (socket && socket.userRole === 'READER') {
+        onlineReaders.push(userId);
+      }
+    }
+    return onlineReaders;
+  }
+
+  // Check if user is connected
+  isUserConnected(userId) {
+    return this.userSockets.has(userId);
   }
 }
 

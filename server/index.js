@@ -17,6 +17,7 @@ const sessionRoutes = require('./routes/sessions');
 const messageRoutes = require('./routes/messages');
 const stripeRoutes = require('./routes/stripe');
 const adminRoutes = require('./routes/admin');
+const bookingRoutes = require('./routes/bookings');
 
 const app = express();
 const server = http.createServer(app);
@@ -69,6 +70,7 @@ app.use('/api/sessions', sessionRoutes);
 app.use('/api/messages', messageRoutes);
 app.use('/api/stripe', stripeRoutes);
 app.use('/api/admin', adminRoutes);
+app.use('/api/bookings', bookingRoutes);
 
 // Serve static files in production
 if (process.env.NODE_ENV === 'production') {

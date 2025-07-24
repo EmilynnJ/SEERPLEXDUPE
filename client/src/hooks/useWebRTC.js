@@ -1,14 +1,16 @@
 import { useEffect, useRef, useState } from 'react';
 import { io } from 'socket.io-client';
-import axios from 'axios';
+import { sessionAPI } from '../utils/api';
 
-export const useWebRTC = (sessionId, userRole, readerRate) => {
+export const useWebRTC = (sessionId, userRole, readerRate, userId) => {
   const [localStream, setLocalStream] = useState(null);
   const [remoteStream, setRemoteStream] = useState(null);
   const [messages, setMessages] = useState([]);
   const [connectionStatus, setConnectionStatus] = useState('connecting');
   const [sessionTime, setSessionTime] = useState(0);
   const [balance, setBalance] = useState(0);
+  const [isVideoEnabled, setIsVideoEnabled] = useState(true);
+  const [isAudioEnabled, setIsAudioEnabled] = useState(true);
   
   const socketRef = useRef();
   const peerConnectionRef = useRef();
@@ -17,44 +19,56 @@ export const useWebRTC = (sessionId, userRole, readerRate) => {
   const sessionTimerRef = useRef();
 
   useEffect(() => {
-    initializeWebRTC();
+    if (sessionId && userId) {
+      initializeWebRTC();
+    }
     return cleanup;
-  }, [sessionId]);
+  }, [sessionId, userId]);
 
   const initializeWebRTC = async () => {
     try {
-      // Initialize Socket.IO - use current domain in production
-      const socketUrl = import.meta.env.PROD 
-        ? window.location.origin 
-        : 'http://localhost:4000';
-      socketRef.current = io(socketUrl);
+      // Initialize Socket.IO for production Netlify
+      const socketUrl = window.location.origin;
+      socketRef.current = io(socketUrl, {
+        path: '/.netlify/functions/websocket',
+        transports: ['websocket', 'polling']
+      });
+      
+      // Register user with socket
+      socketRef.current.emit('register-user', { 
+        userId, 
+        token: localStorage.getItem('token') 
+      });
       
       // Get user media
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: true,
+        video: userRole === 'client' || sessionId.includes('video'),
         audio: true
       });
       setLocalStream(stream);
       
-      // Create peer connection
+      // Create peer connection with STUN servers
       peerConnectionRef.current = new RTCPeerConnection({
         iceServers: [
           { urls: 'stun:stun.l.google.com:19302' },
-          { urls: 'stun:stun1.l.google.com:19302' }
+          { urls: 'stun:stun1.l.google.com:19302' },
+          { urls: 'stun:stun2.l.google.com:19302' }
         ]
       });
       
-      // Add local stream
+      // Add local stream tracks
       stream.getTracks().forEach(track => {
         peerConnectionRef.current.addTrack(track, stream);
       });
       
       // Handle remote stream
       peerConnectionRef.current.ontrack = (event) => {
+        console.log('Received remote stream');
         setRemoteStream(event.streams[0]);
+        setConnectionStatus('connected');
       };
       
-      // Setup data channel for chat
+      // Setup data channel for chat (if needed)
       if (userRole === 'client') {
         dataChannelRef.current = peerConnectionRef.current.createDataChannel('chat');
         setupDataChannel();
@@ -68,9 +82,17 @@ export const useWebRTC = (sessionId, userRole, readerRate) => {
       // Setup signaling
       setupSignaling();
       
-      // Start session if client
-      if (userRole === 'client') {
-        startSession();
+      // Join session room
+      socketRef.current.emit('join-session', { sessionId, userId });
+      
+      // Start session timer
+      sessionTimerRef.current = setInterval(() => {
+        setSessionTime(prev => prev + 1);
+      }, 1000);
+      
+      // Start billing if client
+      if (userRole === 'client' && readerRate) {
+        startBilling();
       }
       
     } catch (error) {
@@ -83,40 +105,77 @@ export const useWebRTC = (sessionId, userRole, readerRate) => {
     const socket = socketRef.current;
     const pc = peerConnectionRef.current;
     
-    socket.emit('join-session', sessionId);
-    
     // ICE candidate handling
     pc.onicecandidate = (event) => {
       if (event.candidate) {
-        socket.emit('ice-candidate', {
+        socket.emit('webrtc-ice-candidate', {
           sessionId,
           candidate: event.candidate
         });
       }
     };
     
-    socket.on('ice-candidate', (candidate) => {
-      pc.addIceCandidate(new RTCIceCandidate(candidate));
+    socket.on('webrtc-ice-candidate', async (data) => {
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+      } catch (error) {
+        console.error('Error adding ICE candidate:', error);
+      }
     });
     
     // Offer/Answer handling
-    socket.on('offer', async (offer) => {
-      await pc.setRemoteDescription(offer);
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      socket.emit('answer', { sessionId, answer });
+    socket.on('webrtc-offer', async (data) => {
+      try {
+        await pc.setRemoteDescription(data.offer);
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        socket.emit('webrtc-answer', { sessionId, answer });
+      } catch (error) {
+        console.error('Error handling offer:', error);
+      }
     });
     
-    socket.on('answer', async (answer) => {
-      await pc.setRemoteDescription(answer);
-      setConnectionStatus('connected');
+    socket.on('webrtc-answer', async (data) => {
+      try {
+        await pc.setRemoteDescription(data.answer);
+      } catch (error) {
+        console.error('Error handling answer:', error);
+      }
+    });
+    
+    // Session events
+    socket.on('session-joined', (data) => {
+      console.log('Joined session:', data);
       if (userRole === 'client') {
-        startBilling();
+        initiateCall();
+      }
+    });
+    
+    socket.on('user-joined', (data) => {
+      console.log('User joined:', data);
+      if (userRole === 'reader') {
+        initiateCall();
       }
     });
     
     socket.on('session-ended', () => {
       endSession();
+    });
+    
+    socket.on('session-force-ended', (data) => {
+      console.log('Session force ended:', data.reason);
+      endSession();
+    });
+
+    // Message handling
+    socket.on('session-message', (data) => {
+      setMessages(prev => [...prev, {
+        id: data.id,
+        text: data.message,
+        sender: data.fromUserId === userId ? 'me' : 'other',
+        senderName: data.fromUserName,
+        timestamp: new Date(data.timestamp)
+      }]);
     });
   };
 
@@ -133,20 +192,14 @@ export const useWebRTC = (sessionId, userRole, readerRate) => {
     };
   };
 
-  const startSession = async () => {
+  const initiateCall = async () => {
     try {
       const pc = peerConnectionRef.current;
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
-      socketRef.current.emit('offer', { sessionId, offer });
-      
-      // Start session timer
-      sessionTimerRef.current = setInterval(() => {
-        setSessionTime(prev => prev + 1);
-      }, 1000);
-      
+      socketRef.current.emit('webrtc-offer', { sessionId, offer });
     } catch (error) {
-      console.error('Failed to start session:', error);
+      console.error('Failed to initiate call:', error);
     }
   };
 
@@ -154,32 +207,32 @@ export const useWebRTC = (sessionId, userRole, readerRate) => {
     // Charge every minute
     billingIntervalRef.current = setInterval(async () => {
       try {
-        const response = await axios.post('/api/sessions/charge', {
+        const response = await sessionAPI.chargeSession({
           sessionId,
           amount: Math.round(readerRate * 100) // Convert to cents
         });
         
         setBalance(response.data.balance);
         
-        if (response.data.balance < readerRate) {
+        if (response.data.sessionEnded) {
           endSession();
         }
       } catch (error) {
         console.error('Billing failed:', error);
-        endSession();
+        if (error.response?.data?.sessionEnded) {
+          endSession();
+        }
       }
     }, 60000); // 1 minute
   };
 
   const sendMessage = (text) => {
-    if (dataChannelRef.current && dataChannelRef.current.readyState === 'open') {
-      const message = {
-        text,
-        sender: userRole,
-        timestamp: Date.now()
-      };
-      dataChannelRef.current.send(JSON.stringify(message));
-      setMessages(prev => [...prev, message]);
+    if (socketRef.current) {
+      socketRef.current.emit('session-message', {
+        sessionId,
+        message: text,
+        messageType: 'TEXT'
+      });
     }
   };
 
@@ -188,6 +241,14 @@ export const useWebRTC = (sessionId, userRole, readerRate) => {
       const videoTrack = localStream.getVideoTracks()[0];
       if (videoTrack) {
         videoTrack.enabled = !videoTrack.enabled;
+        setIsVideoEnabled(videoTrack.enabled);
+        
+        // Notify other peer
+        socketRef.current?.emit('media-state-change', {
+          sessionId,
+          mediaType: 'video',
+          enabled: videoTrack.enabled
+        });
       }
     }
   };
@@ -197,6 +258,14 @@ export const useWebRTC = (sessionId, userRole, readerRate) => {
       const audioTrack = localStream.getAudioTracks()[0];
       if (audioTrack) {
         audioTrack.enabled = !audioTrack.enabled;
+        setIsAudioEnabled(audioTrack.enabled);
+        
+        // Notify other peer
+        socketRef.current?.emit('media-state-change', {
+          sessionId,
+          mediaType: 'audio',
+          enabled: audioTrack.enabled
+        });
       }
     }
   };
@@ -204,15 +273,16 @@ export const useWebRTC = (sessionId, userRole, readerRate) => {
   const endSession = async () => {
     try {
       // Notify server
-      await axios.post(`/api/sessions/${sessionId}/end`);
+      await sessionAPI.endSession(sessionId, {});
       
       // Notify other peer
-      socketRef.current.emit('end-session', sessionId);
+      socketRef.current?.emit('end-session', { sessionId });
       
       setConnectionStatus('ended');
       cleanup();
     } catch (error) {
       console.error('Failed to end session:', error);
+      cleanup();
     }
   };
 
@@ -220,26 +290,34 @@ export const useWebRTC = (sessionId, userRole, readerRate) => {
     // Stop local stream
     if (localStream) {
       localStream.getTracks().forEach(track => track.stop());
+      setLocalStream(null);
     }
     
     // Close peer connection
     if (peerConnectionRef.current) {
       peerConnectionRef.current.close();
+      peerConnectionRef.current = null;
     }
     
     // Disconnect socket
     if (socketRef.current) {
       socketRef.current.disconnect();
+      socketRef.current = null;
     }
     
     // Clear intervals
     if (billingIntervalRef.current) {
       clearInterval(billingIntervalRef.current);
+      billingIntervalRef.current = null;
     }
     
     if (sessionTimerRef.current) {
       clearInterval(sessionTimerRef.current);
+      sessionTimerRef.current = null;
     }
+    
+    setRemoteStream(null);
+    setConnectionStatus('disconnected');
   };
 
   return {
@@ -249,6 +327,8 @@ export const useWebRTC = (sessionId, userRole, readerRate) => {
     connectionStatus,
     sessionTime,
     balance,
+    isVideoEnabled,
+    isAudioEnabled,
     sendMessage,
     toggleVideo,
     toggleAudio,
