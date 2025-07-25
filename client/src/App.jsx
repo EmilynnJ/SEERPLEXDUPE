@@ -1,7 +1,6 @@
 import React from 'react';
 import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
 import { useUser } from '@clerk/clerk-react';
-import { AuthProvider } from './contexts/AuthContext';
 import { SocketProvider } from './contexts/SocketContext';
 import { ProtectedRoute } from './components/ProtectedRoute';
 import Header from './components/Header';
@@ -57,8 +56,7 @@ const RoleBasedRedirect = () => {
 
 function App() {
   return (
-    <AuthProvider>
-      <SocketProvider>
+    <SocketProvider>
         <Router>
           <div className="min-h-screen flex flex-col bg-cosmic">
             <Header />
@@ -149,7 +147,6 @@ function App() {
           </div>
         </Router>
       </SocketProvider>
-    </AuthProvider>
   );
 }
 
